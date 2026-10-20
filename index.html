@@ -51,7 +51,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v1.2</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v1.3</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -91,6 +91,7 @@
       <button class="stat" data-k="props"><b id="n-props">0</b><span><i class="dot" style="background:var(--prop)"></i>Propriétés seules</span></button>
     </div>
     <div class="muted" style="margin-top:6px"><span id="n-same">0</span> objets inchangés (en gris).</div>
+    <div class="muted" id="summary" style="margin-top:4px"></div>
     <label class="chk"><input type="checkbox" id="isolate"> N'afficher que la catégorie sélectionnée</label>
     <div class="btns">
       <button id="showA">Voir les supprimés (version A)</button>
@@ -107,6 +108,8 @@
 const CHUNK = 200;                 // objets par appel API (réduit automatiquement si lent)
 const API_TIMEOUT = 300000;        // 5 min par appel vers la vue 3D
 const LOAD_TIMEOUT = 10 * 60e3;    // 10 min max pour charger une version
+// conteneurs (projet, site, bâtiment, niveau…) : exclus, sinon les colorer colore toute la maquette
+const SPATIAL = /^ifc(project|site|building|buildingstorey|space|zone|spatialzone|facility|facilitypart|bridge|bridgepart|road|roadpart|railway|railwaypart|tunnel|tunnelpart|marinefacility|grid|annotation|group|systemfurniture|distributionsystem|system)$/i;
 const COLORS = {
   added:  "#1E8A44",
   deleted:"#DA212C",
@@ -230,15 +233,19 @@ async function loadVersion(modelId, versionId){
     try { ms = await API.viewer.getModels("loaded"); } catch(e){ if (!isTimeout(e)) throw e; }
     const m = (ms||[]).find(x => x.id === modelId);
     if (m && m.versionId === versionId && m.state === "loaded"){
-      // laisse le temps aux objets d'être indexés
-      for (let i=0;i<20;i++){
-        let o = null;
-        try { o = await API.viewer.getObjects({ modelObjectIds:[{ modelId }] }); } catch(e){ if (!isTimeout(e)) throw e; }
-        const n = idsFrom(o, modelId).length;
-        if (n > 0) return;
-        await sleep(1000);
+      // attend que le nombre d'objets indexés soit stable (3 relevés identiques)
+      let last = -1, same = 0;
+      const t1 = Date.now();
+      while (Date.now() - t1 < 180000){
+        let n = 0;
+        try { n = (await listObjectIds(modelId, "Indexation")).length; } catch(e){ if (!isTimeout(e)) throw e; }
+        status(`Indexation de la version : ${n} objets…`);
+        if (n > 0 && n === last){ if (++same >= 3) return; } else same = 0;
+        last = n;
+        await sleep(2500);
       }
-      return;
+      if (last > 0) return;
+      throw new Error("La version est chargée mais ses objets ne sont pas accessibles.");
     }
     await sleep(1500);
   }
@@ -292,7 +299,7 @@ async function snapshot(modelId, label, onP){
   const ids = await listObjectIds(modelId, label);
   if (!ids.length) throw new Error("La vue 3D ne renvoie aucun objet pour cette maquette. Vérifie qu'elle est bien affichée (œil activé) puis réessaie.");
   const map = new Map();
-  let noGuid = 0;
+  let noGuid = 0, spatial = 0;
 
   let size = CHUNK;
   for (let i=0; i<ids.length; ){
@@ -314,6 +321,7 @@ async function snapshot(modelId, label, onP){
       const guid = guids[k];
       if (!guid){ noGuid++; return; }
       const p = pById.get(rid) || {};
+      if (SPATIAL.test(p.class || "")){ spatial++; return; }
       const flat = flatten(p.properties, ignore);
       const bb = bById.get(rid)?.boundingBox;
       const geo = (bb && bb.min && bb.max) ? [bb.min.x,bb.min.y,bb.min.z,bb.max.x,bb.max.y,bb.max.z].map(r).join(",") : "";
@@ -330,7 +338,7 @@ async function snapshot(modelId, label, onP){
     i += chunk.length;
     onP && onP(Math.min(1,i/ids.length), `${label} : ${i} / ${ids.length} objets lus`);
   }
-  return { map, total: ids.length, noGuid };
+  return { map, total: ids.length, noGuid, spatial };
 }
 
 /* ===================== Comparaison ===================== */
@@ -414,7 +422,11 @@ async function run(){
     await paint("B");
     progress(null);
     const warn = (snapA.noGuid + snapB.noGuid) ? `\n${snapA.noGuid + snapB.noGuid} objets sans GUID ont été ignorés.` : "";
-    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn);
+    const ratio = Math.min(snapA.map.size, snapB.map.size) / Math.max(1, Math.max(snapA.map.size, snapB.map.size));
+    const alert = (diff.same.length === 0 && snapA.map.size && snapB.map.size)
+      ? "\n⚠ Aucun objet commun : les GUID ont probablement été régénérés à l'export (comparaison GUID non exploitable pour ces versions)."
+      : (ratio < 0.2 ? "\n⚠ Écart de taille très important entre A et B : vérifie que les deux versions sont complètes." : "");
+    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn + alert);
   }catch(e){
     progress(null);
     status("Erreur pendant « " + (step || "préparation") + " » : " + (e.message || e) + "\nAstuce : réessaie, ou teste d'abord une maquette plus légère.", true);
@@ -428,6 +440,8 @@ function renderResults(){
   $("results").style.display = "block";
   for (const k of ["added","deleted","geom","props"]) $("n-"+k).textContent = diff[k].length;
   $("n-same").textContent = diff.same.length;
+  $("summary").textContent = `Objets comparés : A = ${snapA.map.size}, B = ${snapB.map.size}` +
+    ` (conteneurs exclus : ${snapA.spatial}/${snapB.spatial}, sans GUID : ${snapA.noGuid}/${snapB.noGuid}).`;
   document.querySelectorAll(".stat").forEach(b => b.classList.toggle("on", b.dataset.k === activeCat));
   renderList();
 }
