@@ -1,0 +1,8 @@
+{
+  "url": "https://gadeaubtp-coder.github.io/tc-compare/index.html",
+  "title": "Comparateur de versions",
+  "icon": "https://gadeaubtp-coder.github.io/tc-compare/icon.svg",
+  "infoUrl": "https://gadeaubtp-coder.github.io/tc-compare/README.md",
+  "description": "Compare deux versions d'une même maquette (ajouts, suppressions, géométrie, propriétés) directement dans la vue 3D.",
+  "extensionType": ["3dviewer"]
+}

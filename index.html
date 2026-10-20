@@ -1,0 +1,471 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Comparateur de versions</title>
+<script src="https://components.connect.trimble.com/trimble-connect-workspace-api/index.js"></script>
+<style>
+  :root{
+    --blue:#0063a3; --blue-d:#004f83; --ink:#252a2e; --mute:#6a6e79; --line:#e0e1e9; --bg:#f7f8fa; --card:#fff;
+    --add:#1e8a44; --del:#da212c; --geo:#e49325; --prop:#217cbb; --ghost:#c9ccd4;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--ink);font:13px/1.4 "Open Sans",Segoe UI,Roboto,Arial,sans-serif}
+  .wrap{padding:12px 12px 24px}
+  h1{font-size:15px;margin:0 0 2px}
+  .sub{color:var(--mute);font-size:12px;margin-bottom:12px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:4px;padding:10px;margin-bottom:10px}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--mute);margin:0 0 8px}
+  label{display:block;font-size:12px;color:var(--mute);margin:8px 0 3px}
+  select,input[type=text]{width:100%;padding:6px 8px;border:1px solid #b7b9c3;border-radius:3px;font:inherit;background:#fff;color:var(--ink)}
+  .row{display:flex;gap:6px;align-items:center}
+  .row > *{flex:1}
+  button{font:inherit;border-radius:3px;padding:7px 10px;cursor:pointer;border:1px solid var(--blue);background:#fff;color:var(--blue)}
+  button.primary{background:var(--blue);color:#fff}
+  button.primary:hover{background:var(--blue-d)}
+  button:disabled{opacity:.45;cursor:default}
+  .btns{display:flex;gap:6px;margin-top:10px;flex-wrap:wrap}
+  .status{font-size:12px;color:var(--mute);margin-top:8px;min-height:16px;white-space:pre-wrap}
+  .bar{height:4px;background:var(--line);border-radius:2px;overflow:hidden;margin-top:6px;display:none}
+  .bar i{display:block;height:100%;width:0;background:var(--blue);transition:width .2s}
+  .stats{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+  .stat{border:1px solid var(--line);border-radius:4px;padding:7px 8px;cursor:pointer;background:#fff;text-align:left;color:var(--ink)}
+  .stat.on{outline:2px solid var(--blue)}
+  .stat b{display:block;font-size:18px}
+  .stat span{font-size:11px;color:var(--mute);display:flex;align-items:center;gap:5px}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block;flex:none}
+  .list{max-height:340px;overflow:auto;border-top:1px solid var(--line);margin-top:8px}
+  .item{padding:6px 2px;border-bottom:1px solid var(--line);cursor:pointer}
+  .item:hover{background:#eef4fa}
+  .item .n{font-weight:600;display:flex;gap:6px;align-items:center}
+  .item .c{color:var(--mute);font-size:11px}
+  .diff{font-size:11px;margin:4px 0 2px 15px}
+  .diff div{padding:1px 0}
+  .diff s{color:var(--del)} .diff ins{color:var(--add);text-decoration:none}
+  .muted{color:var(--mute);font-size:12px}
+  .chk{display:flex;gap:6px;align-items:center;font-size:12px;margin-top:8px;color:var(--ink)}
+  .err{color:var(--del)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Comparateur de versions</h1>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID).</div>
+
+  <div class="card">
+    <h2>1 · Maquette</h2>
+    <div class="row">
+      <select id="model"><option value="">Chargement…</option></select>
+      <button id="refresh" title="Rafraîchir la liste" style="flex:0 0 auto">↻</button>
+    </div>
+    <div class="muted" style="margin-top:4px">Charge d'abord la maquette dans la vue 3D pour qu'elle apparaisse ici.</div>
+
+    <label for="vA">Version A (ancienne)</label>
+    <select id="vA" disabled></select>
+    <label for="vB">Version B (nouvelle)</label>
+    <select id="vB" disabled></select>
+
+    <details style="margin-top:8px">
+      <summary class="muted" style="cursor:pointer">Options</summary>
+      <label for="ignore">Propriétés à ignorer (séparées par des virgules, ex. « Date de modification, Revision »)</label>
+      <input type="text" id="ignore" placeholder="aucune">
+      <label for="tol">Tolérance géométrique (mm)</label>
+      <input type="text" id="tol" value="1">
+    </details>
+
+    <div class="btns">
+      <button class="primary" id="run" disabled>Comparer</button>
+      <button id="reset">Réinitialiser la vue</button>
+    </div>
+    <div class="bar" id="bar"><i></i></div>
+    <div class="status" id="status"></div>
+  </div>
+
+  <div class="card" id="results" style="display:none">
+    <h2>2 · Résultats</h2>
+    <div class="stats">
+      <button class="stat" data-k="added"><b id="n-added">0</b><span><i class="dot" style="background:var(--add)"></i>Ajoutés</span></button>
+      <button class="stat" data-k="deleted"><b id="n-deleted">0</b><span><i class="dot" style="background:var(--del)"></i>Supprimés</span></button>
+      <button class="stat" data-k="geom"><b id="n-geom">0</b><span><i class="dot" style="background:var(--geo)"></i>Géométrie modifiée</span></button>
+      <button class="stat" data-k="props"><b id="n-props">0</b><span><i class="dot" style="background:var(--prop)"></i>Propriétés seules</span></button>
+    </div>
+    <div class="muted" style="margin-top:6px"><span id="n-same">0</span> objets inchangés (en gris).</div>
+    <label class="chk"><input type="checkbox" id="isolate"> N'afficher que la catégorie sélectionnée</label>
+    <div class="btns">
+      <button id="showA">Voir les supprimés (version A)</button>
+      <button id="showB">Revenir à la version B</button>
+      <button id="csv">Exporter CSV</button>
+    </div>
+    <input type="text" id="filter" placeholder="Filtrer par nom, classe, GUID…" style="margin-top:10px">
+    <div class="list" id="list"></div>
+  </div>
+</div>
+
+<script>
+/* ===================== Configuration ===================== */
+const CHUNK = 500;                 // objets par appel API
+const LOAD_TIMEOUT = 10 * 60e3;    // 10 min max pour charger une version
+const COLORS = {
+  added:  "#1E8A44",
+  deleted:"#DA212C",
+  geom:   "#E49325",
+  props:  "#217CBB",
+  ghost:  { r: 201, g: 204, b: 212, a: 40 }
+};
+// Hôtes de l'API Core Trimble Connect par région
+const HOSTS = {
+  europe: "https://app21.connect.trimble.com/tc/api/2.0",
+  northamerica: "https://app.connect.trimble.com/tc/api/2.0",
+  asia: "https://app31.connect.trimble.com/tc/api/2.0",
+  australia: "https://app32.connect.trimble.com/tc/api/2.0"
+};
+
+/* ===================== État ===================== */
+let API = null, token = null, project = null;
+let snapA = null, snapB = null, diff = null, current = null;
+let activeCat = null, loadedSide = null;
+const $ = id => document.getElementById(id);
+
+/* ===================== Utilitaires UI ===================== */
+function status(msg, isErr){ const s=$("status"); s.textContent=msg||""; s.className="status"+(isErr?" err":""); }
+function progress(p){ const b=$("bar"); if(p==null){b.style.display="none";return;} b.style.display="block"; b.firstElementChild.style.width=Math.round(p*100)+"%"; }
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+const esc = s => String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function fmtDate(d){ try{ return new Date(d).toLocaleString("fr-FR",{dateStyle:"short",timeStyle:"short"}); }catch{ return d||""; } }
+
+/* ===================== Connexion ===================== */
+async function init(){
+  try{
+    API = await TrimbleConnectWorkspace.connect(window.parent, onEvent, 30000);
+  }catch(e){
+    status("Impossible de se connecter à Trimble Connect. Cette page doit être ouverte comme extension de la vue 3D.", true);
+    return;
+  }
+  project = await API.project.getProject();
+  const t = await API.extension.requestPermission("accesstoken");
+  if (t && t !== "pending" && t !== "denied") token = t;
+  if (t === "denied") status("Accès au jeton refusé : la liste des versions ne pourra pas être lue. Réactive l'autorisation dans les paramètres de l'extension.", true);
+  await refreshModels();
+}
+function onEvent(event, args){
+  if (event === "extension.accessToken"){
+    const v = args && args.data !== undefined ? args.data : args;
+    if (v && v !== "pending" && v !== "denied"){ token = v; if ($("model").value) loadVersions(); }
+  }
+}
+
+/* ===================== Maquettes et versions ===================== */
+async function refreshModels(){
+  const sel = $("model");
+  const models = (await API.viewer.getModels()) || [];
+  const loaded = models.filter(m => m.state === "loaded");
+  const pool = loaded.length ? loaded : models;
+  const prev = sel.value;
+  sel.innerHTML = pool.length
+    ? '<option value="">— Choisir une maquette —</option>' + pool.map(m=>`<option value="${esc(m.id)}">${esc(m.name)}</option>`).join("")
+    : '<option value="">Aucune maquette chargée dans la vue 3D</option>';
+  if (prev && pool.some(m=>m.id===prev)) sel.value = prev;
+  if (sel.value) loadVersions();
+}
+
+async function coreFetch(path){
+  if (!token) throw new Error("Jeton d'accès non disponible (accepte la demande d'autorisation de l'extension).");
+  const loc = String(project?.location || "").toLowerCase().replace(/[\s_-]/g,"");
+  const order = [HOSTS[loc], ...Object.values(HOSTS)].filter((h,i,a)=>h && a.indexOf(h)===i);
+  let lastErr;
+  for (const host of order){
+    try{
+      const r = await fetch(host + path, { headers: { Authorization: "Bearer " + token } });
+      if (r.ok) return r.json();
+      lastErr = new Error("HTTP " + r.status);
+    }catch(e){ lastErr = e; }
+  }
+  throw lastErr;
+}
+
+async function loadVersions(){
+  const id = $("model").value;
+  const vA = $("vA"), vB = $("vB");
+  vA.disabled = vB.disabled = $("run").disabled = true;
+  if (!id){ vA.innerHTML = vB.innerHTML = ""; return; }
+  status("Lecture de l'historique des versions…");
+  try{
+    let versions = await coreFetch(`/files/${encodeURIComponent(id)}/versions`);
+    versions = (Array.isArray(versions) ? versions : versions.items || [])
+      .sort((a,b)=> new Date(b.createdOn||b.modifiedOn) - new Date(a.createdOn||a.modifiedOn));
+    if (versions.length < 2){ status("Cette maquette n'a qu'une seule version : rien à comparer."); vA.innerHTML=vB.innerHTML=""; return; }
+    const opt = (v,i) => {
+      const who = v.modifiedBy ? `${v.modifiedBy.firstName||""} ${v.modifiedBy.lastName||""}`.trim() : (v.createdBy ? `${v.createdBy.firstName||""} ${v.createdBy.lastName||""}`.trim() : "");
+      const rev = v.revision != null ? `v${v.revision}` : `#${versions.length - i}`;
+      return `<option value="${esc(v.versionId)}">${esc(rev)} · ${esc(fmtDate(v.createdOn||v.modifiedOn))}${who?" · "+esc(who):""}</option>`;
+    };
+    vA.innerHTML = vB.innerHTML = versions.map(opt).join("");
+    vB.selectedIndex = 0; vA.selectedIndex = 1;
+    vA.disabled = vB.disabled = $("run").disabled = false;
+    status("");
+  }catch(e){
+    status("Impossible de lire les versions : " + e.message, true);
+  }
+}
+
+/* ===================== Chargement d'une version ===================== */
+async function loadVersion(modelId, versionId){
+  await API.viewer.toggleModelVersion({ id: modelId, versionId }, true, false);
+  const t0 = Date.now();
+  while (Date.now() - t0 < LOAD_TIMEOUT){
+    const ms = await API.viewer.getModels("loaded");
+    const m = (ms||[]).find(x => x.id === modelId);
+    if (m && m.versionId === versionId && m.state === "loaded"){
+      // laisse le temps aux objets d'être indexés
+      for (let i=0;i<20;i++){
+        const o = await API.viewer.getObjects({ modelObjectIds:[{ modelId }] });
+        const n = (o||[]).reduce((s,x)=>s+(x.objects?.length||0),0);
+        if (n > 0) return;
+        await sleep(1000);
+      }
+      return;
+    }
+    await sleep(1500);
+  }
+  throw new Error("La version n'a pas fini de se charger dans le délai imparti.");
+}
+
+/* ===================== Extraction (instantané) ===================== */
+async function guidsFor(modelId, ids){
+  try { return await API.viewer.convertToObjectIds(modelId, ids); }
+  catch(e){
+    // l'API échoue si un seul objet n'a pas d'ID externe : on découpe
+    if (ids.length === 1) return [null];
+    const h = Math.ceil(ids.length/2);
+    return [...await guidsFor(modelId, ids.slice(0,h)), ...await guidsFor(modelId, ids.slice(h))];
+  }
+}
+
+function flatten(props, ignore){
+  const out = {};
+  for (const set of props || []){
+    for (const p of set.properties || []){
+      if (ignore.has(String(p.name).toLowerCase())) continue;
+      out[`${set.name} › ${p.name}`] = p.value;
+    }
+  }
+  return out;
+}
+function hashStr(s){ let h=2166136261; for (let i=0;i<s.length;i++){ h^=s.charCodeAt(i); h=Math.imul(h,16777619); } return (h>>>0).toString(36); }
+
+async function snapshot(modelId, label, onP){
+  const ignore = new Set($("ignore").value.split(",").map(s=>s.trim().toLowerCase()).filter(Boolean));
+  const tolM = Math.max(0.0001, (parseFloat(String($("tol").value).replace(",", ".")) || 1) / 1000);
+  const r = v => Math.round(v / tolM);
+
+  const mo = await API.viewer.getObjects({ modelObjectIds:[{ modelId }] });
+  const ids = (mo||[]).filter(x=>x.modelId===modelId).flatMap(x=>x.objects.map(o=>o.id));
+  const map = new Map();
+  let noGuid = 0;
+
+  for (let i=0; i<ids.length; i+=CHUNK){
+    const chunk = ids.slice(i, i+CHUNK);
+    const [guids, props, boxes] = await Promise.all([
+      guidsFor(modelId, chunk),
+      API.viewer.getObjectProperties(modelId, chunk),
+      API.viewer.getObjectBoundingBoxes(modelId, chunk).catch(()=>[])
+    ]);
+    const pById = new Map((props||[]).map(p=>[p.id,p]));
+    const bById = new Map((boxes||[]).map(b=>[b.id,b]));
+    chunk.forEach((rid, k) => {
+      const guid = guids[k];
+      if (!guid){ noGuid++; return; }
+      const p = pById.get(rid) || {};
+      const flat = flatten(p.properties, ignore);
+      const bb = bById.get(rid)?.boundingBox;
+      const geo = bb ? [bb.min.x,bb.min.y,bb.min.z,bb.max.x,bb.max.y,bb.max.z].map(r).join(",") : "";
+      const keys = Object.keys(flat).sort();
+      map.set(guid, {
+        guid, rid,
+        name: p.product?.name || flat["Element › Name"] || flat[keys.find(k=>/›\s*name$/i.test(k))] || p.class || "(sans nom)",
+        cls: p.class || "",
+        geo,
+        ph: hashStr(keys.map(k=>k+"="+flat[k]).join("|")),
+        flat
+      });
+    });
+    onP && onP(Math.min(1,(i+CHUNK)/ids.length), `${label} : ${Math.min(i+CHUNK,ids.length)} / ${ids.length} objets lus`);
+  }
+  return { map, total: ids.length, noGuid };
+}
+
+/* ===================== Comparaison ===================== */
+function compare(A, B){
+  const d = { added:[], deleted:[], geom:[], props:[], same:[] };
+  for (const [g,b] of B.map){
+    const a = A.map.get(g);
+    if (!a) d.added.push({ b });
+    else if (a.geo !== b.geo) d.geom.push({ a, b });
+    else if (a.ph !== b.ph) d.props.push({ a, b });
+    else d.same.push({ a, b });
+  }
+  for (const [g,a] of A.map) if (!B.map.has(g)) d.deleted.push({ a });
+  return d;
+}
+function propDiff(a, b){
+  const out = [];
+  const keys = new Set([...Object.keys(a.flat), ...Object.keys(b.flat)]);
+  for (const k of keys){
+    const va = a.flat[k], vb = b.flat[k];
+    if (String(va) !== String(vb)) out.push({ k, va, vb });
+  }
+  return out;
+}
+
+/* ===================== Coloration ===================== */
+const sel = (modelId, rids) => ({ modelObjectIds:[{ modelId, objectRuntimeIds: rids }] });
+
+async function paint(side){
+  const modelId = current.modelId;
+  await API.viewer.setObjectState(undefined, { color: "reset", visible: "reset" });
+  await API.viewer.setObjectState(sel(modelId), { color: COLORS.ghost });
+  const cats = side === "A" ? ["deleted"] : ["added","geom","props"];
+  const iso = $("isolate").checked && activeCat;
+  if (iso && cats.includes(activeCat)){
+    await API.viewer.setObjectState(sel(modelId), { visible: false });
+  }
+  for (const k of cats){
+    if (iso && k !== activeCat) continue;
+    const rids = diff[k].map(x => (side === "A" ? x.a : x.b).rid);
+    for (let i=0;i<rids.length;i+=5000){
+      const s = sel(modelId, rids.slice(i,i+5000));
+      await API.viewer.setObjectState(s, iso ? { color: COLORS[k], visible: true } : { color: COLORS[k] });
+    }
+  }
+}
+
+async function switchTo(side){
+  const vid = side === "A" ? current.vA : current.vB;
+  if (loadedSide !== side){
+    status(`Chargement de la version ${side}…`);
+    await loadVersion(current.modelId, vid);
+    loadedSide = side;
+  }
+  await paint(side);
+  status(side === "A" ? "Version A affichée : objets supprimés en rouge." : "Version B affichée : ajoutés en vert, géométrie modifiée en orange, propriétés seules en bleu.");
+}
+
+/* ===================== Lancement ===================== */
+async function run(){
+  const modelId = $("model").value, vA = $("vA").value, vB = $("vB").value;
+  if (vA === vB){ status("Choisis deux versions différentes.", true); return; }
+  $("run").disabled = true; $("results").style.display = "none";
+  try{
+    current = { modelId, vA, vB, name: $("model").selectedOptions[0].textContent,
+                labelA: $("vA").selectedOptions[0].textContent, labelB: $("vB").selectedOptions[0].textContent };
+    const step = (base, span) => (p,msg) => { progress(base + p*span); status(msg); };
+
+    status("Chargement de la version A…"); progress(0.02);
+    await loadVersion(modelId, vA); loadedSide = "A";
+    snapA = await snapshot(modelId, "Version A", step(0.05, 0.4));
+
+    status("Chargement de la version B…");
+    await loadVersion(modelId, vB); loadedSide = "B";
+    snapB = await snapshot(modelId, "Version B", step(0.5, 0.45));
+
+    diff = compare(snapA, snapB);
+    activeCat = null;
+    renderResults();
+    await paint("B");
+    progress(null);
+    const warn = (snapA.noGuid + snapB.noGuid) ? `\n${snapA.noGuid + snapB.noGuid} objets sans GUID ont été ignorés.` : "";
+    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn);
+  }catch(e){
+    progress(null);
+    status("Erreur : " + (e.message || e), true);
+  }finally{
+    $("run").disabled = false;
+  }
+}
+
+/* ===================== Résultats ===================== */
+function renderResults(){
+  $("results").style.display = "block";
+  for (const k of ["added","deleted","geom","props"]) $("n-"+k).textContent = diff[k].length;
+  $("n-same").textContent = diff.same.length;
+  document.querySelectorAll(".stat").forEach(b => b.classList.toggle("on", b.dataset.k === activeCat));
+  renderList();
+}
+
+function rowsFor(cat){
+  const cats = cat ? [cat] : ["added","deleted","geom","props"];
+  return cats.flatMap(k => diff[k].map(x => ({ k, o: x.b || x.a, x })));
+}
+
+function renderList(){
+  const q = $("filter").value.trim().toLowerCase();
+  let rows = rowsFor(activeCat);
+  if (q) rows = rows.filter(r => (r.o.name+" "+r.o.cls+" "+r.o.guid).toLowerCase().includes(q));
+  const MAX = 400;
+  const html = rows.slice(0, MAX).map((r,i) => `
+    <div class="item" data-i="${i}">
+      <div class="n"><i class="dot" style="background:${COLORS[r.k]}"></i>${esc(r.o.name)}</div>
+      <div class="c">${esc(r.o.cls)} · ${esc(r.o.guid)}</div>
+    </div>`).join("");
+  $("list").innerHTML = html + (rows.length > MAX ? `<div class="muted" style="padding:6px 2px">… ${rows.length - MAX} autres. Affine avec le filtre ou exporte le CSV.</div>` : "")
+    + (rows.length ? "" : '<div class="muted" style="padding:6px 2px">Aucun élément.</div>');
+  $("list")._rows = rows;
+}
+
+async function focusRow(el){
+  const r = $("list")._rows[+el.dataset.i];
+  const side = r.k === "deleted" ? "A" : "B";
+  if (loadedSide !== side) await switchTo(side);
+  const s = sel(current.modelId, [ (side === "A" ? (r.x.a) : (r.x.b)).rid ]);
+  await API.viewer.setSelection(s, "set");
+  await API.viewer.setCamera(s, { animationTime: 400 });
+  // détail des propriétés modifiées
+  document.querySelectorAll(".diff").forEach(d=>d.remove());
+  if (r.x.a && r.x.b){
+    const pd = propDiff(r.x.a, r.x.b);
+    const box = document.createElement("div"); box.className = "diff";
+    box.innerHTML = (r.k === "geom" ? "<div><b>Position / emprise modifiée</b></div>" : "")
+      + (pd.length ? pd.slice(0,30).map(d=>`<div>${esc(d.k)} : <s>${esc(d.va ?? "—")}</s> → <ins>${esc(d.vb ?? "—")}</ins></div>`).join("") : '<div class="muted">Aucune propriété modifiée.</div>');
+    el.appendChild(box);
+  }
+}
+
+function exportCsv(){
+  const label = { added:"Ajouté", deleted:"Supprimé", geom:"Géométrie modifiée", props:"Propriétés modifiées" };
+  const q = v => `"${String(v ?? "").replace(/"/g,'""')}"`;
+  const lines = [["Statut","GUID","Nom","Classe","Propriété","Valeur A","Valeur B"].map(q).join(";")];
+  for (const r of rowsFor(null)){
+    const pd = (r.x.a && r.x.b) ? propDiff(r.x.a, r.x.b) : [];
+    if (!pd.length) lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, "", "", ""].map(q).join(";"));
+    else pd.forEach(d => lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, d.k, d.va, d.vb].map(q).join(";")));
+  }
+  const blob = new Blob(["﻿" + lines.join("\r\n")], { type:"text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `comparaison_${current.name.replace(/[^\w.-]+/g,"_")}.csv`;
+  a.click();
+}
+
+/* ===================== Événements ===================== */
+$("refresh").onclick = () => refreshModels();
+$("model").onchange = () => loadVersions();
+$("run").onclick = run;
+$("reset").onclick = async () => { await API.viewer.setObjectState(undefined, { color:"reset", visible:"reset" }); status("Vue réinitialisée."); };
+$("showA").onclick = () => switchTo("A").catch(e=>status(e.message,true));
+$("showB").onclick = () => switchTo("B").catch(e=>status(e.message,true));
+$("csv").onclick = exportCsv;
+$("filter").oninput = renderList;
+$("isolate").onchange = () => paint(loadedSide);
+$("list").onclick = e => { const it = e.target.closest(".item"); if (it) focusRow(it).catch(err=>status(err.message,true)); };
+document.querySelectorAll(".stat").forEach(b => b.onclick = async () => {
+  activeCat = activeCat === b.dataset.k ? null : b.dataset.k;
+  renderResults();
+  const side = activeCat === "deleted" ? "A" : "B";
+  if (loadedSide !== side) await switchTo(side); else await paint(side);
+});
+
+init();
+</script>
+</body>
+</html>
