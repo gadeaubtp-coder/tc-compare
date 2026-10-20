@@ -104,7 +104,8 @@
 
 <script>
 /* ===================== Configuration ===================== */
-const CHUNK = 500;                 // objets par appel API
+const CHUNK = 200;                 // objets par appel API (réduit automatiquement si lent)
+const API_TIMEOUT = 300000;        // 5 min par appel vers la vue 3D
 const LOAD_TIMEOUT = 10 * 60e3;    // 10 min max pour charger une version
 const COLORS = {
   added:  "#1E8A44",
@@ -126,6 +127,14 @@ let API = null, token = null, project = null;
 let snapA = null, snapB = null, diff = null, current = null;
 let activeCat = null, loadedSide = null;
 const $ = id => document.getElementById(id);
+let step = "";
+const isTimeout = e => /timed out|timeout/i.test(String(e && (e.message || e)));
+async function retry(label, fn, tries = 3){
+  for (let i = 1; ; i++){
+    try { return await fn(); }
+    catch(e){ if (!isTimeout(e) || i >= tries) throw e; status(label + " : lent, nouvel essai (" + (i+1) + "/" + tries + ")…"); await sleep(2000); }
+  }
+}
 
 /* ===================== Utilitaires UI ===================== */
 function status(msg, isErr){ const s=$("status"); s.textContent=msg||""; s.className="status"+(isErr?" err":""); }
@@ -137,7 +146,7 @@ function fmtDate(d){ try{ return new Date(d).toLocaleString("fr-FR",{dateStyle:"
 /* ===================== Connexion ===================== */
 async function init(){
   try{
-    API = await TrimbleConnectWorkspace.connect(window.parent, onEvent, 30000);
+    API = await TrimbleConnectWorkspace.connect(window.parent, onEvent, API_TIMEOUT);
   }catch(e){
     status("Impossible de se connecter à Trimble Connect. Cette page doit être ouverte comme extension de la vue 3D.", true);
     return;
@@ -211,15 +220,19 @@ async function loadVersions(){
 
 /* ===================== Chargement d'une version ===================== */
 async function loadVersion(modelId, versionId){
-  await API.viewer.toggleModelVersion({ id: modelId, versionId }, true, false);
+  step = "chargement de la version";
+  try { await API.viewer.toggleModelVersion({ id: modelId, versionId }, true, false); }
+  catch(e){ if (!isTimeout(e)) throw e; /* le chargement continue côté viewer : on surveille */ }
   const t0 = Date.now();
   while (Date.now() - t0 < LOAD_TIMEOUT){
-    const ms = await API.viewer.getModels("loaded");
+    let ms = null;
+    try { ms = await API.viewer.getModels("loaded"); } catch(e){ if (!isTimeout(e)) throw e; }
     const m = (ms||[]).find(x => x.id === modelId);
     if (m && m.versionId === versionId && m.state === "loaded"){
       // laisse le temps aux objets d'être indexés
       for (let i=0;i<20;i++){
-        const o = await API.viewer.getObjects({ modelObjectIds:[{ modelId }] });
+        let o = null;
+        try { o = await API.viewer.getObjects({ modelObjectIds:[{ modelId }] }); } catch(e){ if (!isTimeout(e)) throw e; }
         const n = (o||[]).reduce((s,x)=>s+(x.objects?.length||0),0);
         if (n > 0) return;
         await sleep(1000);
@@ -235,6 +248,7 @@ async function loadVersion(modelId, versionId){
 async function guidsFor(modelId, ids){
   try { return await API.viewer.convertToObjectIds(modelId, ids); }
   catch(e){
+    if (isTimeout(e)) throw e;
     // l'API échoue si un seul objet n'a pas d'ID externe : on découpe
     if (ids.length === 1) return [null];
     const h = Math.ceil(ids.length/2);
@@ -259,18 +273,25 @@ async function snapshot(modelId, label, onP){
   const tolM = Math.max(0.0001, (parseFloat(String($("tol").value).replace(",", ".")) || 1) / 1000);
   const r = v => Math.round(v / tolM);
 
-  const mo = await API.viewer.getObjects({ modelObjectIds:[{ modelId }] });
+  step = "inventaire des objets (" + label + ")";
+  const mo = await retry(label, () => API.viewer.getObjects({ modelObjectIds:[{ modelId }] }));
   const ids = (mo||[]).filter(x=>x.modelId===modelId).flatMap(x=>x.objects.map(o=>o.id));
   const map = new Map();
   let noGuid = 0;
 
-  for (let i=0; i<ids.length; i+=CHUNK){
-    const chunk = ids.slice(i, i+CHUNK);
-    const [guids, props, boxes] = await Promise.all([
-      guidsFor(modelId, chunk),
-      API.viewer.getObjectProperties(modelId, chunk),
-      API.viewer.getObjectBoundingBoxes(modelId, chunk).catch(()=>[])
-    ]);
+  let size = CHUNK;
+  for (let i=0; i<ids.length; ){
+    const chunk = ids.slice(i, i+size);
+    step = "lecture des objets (" + label + ")";
+    let guids, props, boxes;
+    try{
+      guids = await guidsFor(modelId, chunk);
+      props = await API.viewer.getObjectProperties(modelId, chunk);
+      boxes = await API.viewer.getObjectBoundingBoxes(modelId, chunk).catch(()=>[]);
+    }catch(e){
+      if (isTimeout(e) && size > 1){ size = Math.max(1, Math.floor(size/2)); onP && onP(i/ids.length, label + " : paquets réduits à " + size + " objets…"); continue; }
+      throw e;
+    }
     const pById = new Map((props||[]).map(p=>[p.id,p]));
     const bById = new Map((boxes||[]).map(b=>[b.id,b]));
     chunk.forEach((rid, k) => {
@@ -290,7 +311,8 @@ async function snapshot(modelId, label, onP){
         flat
       });
     });
-    onP && onP(Math.min(1,(i+CHUNK)/ids.length), `${label} : ${Math.min(i+CHUNK,ids.length)} / ${ids.length} objets lus`);
+    i += chunk.length;
+    onP && onP(Math.min(1,i/ids.length), `${label} : ${i} / ${ids.length} objets lus`);
   }
   return { map, total: ids.length, noGuid };
 }
@@ -322,6 +344,7 @@ function propDiff(a, b){
 const sel = (modelId, rids) => ({ modelObjectIds:[{ modelId, objectRuntimeIds: rids }] });
 
 async function paint(side){
+  step = "coloration";
   const modelId = current.modelId;
   await API.viewer.setObjectState(undefined, { color: "reset", visible: "reset" });
   await API.viewer.setObjectState(sel(modelId), { color: COLORS.ghost });
@@ -378,7 +401,7 @@ async function run(){
     status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn);
   }catch(e){
     progress(null);
-    status("Erreur : " + (e.message || e), true);
+    status("Erreur pendant « " + (step || "préparation") + " » : " + (e.message || e) + "\nAstuce : réessaie, ou teste d'abord une maquette plus légère.", true);
   }finally{
     $("run").disabled = false;
   }
