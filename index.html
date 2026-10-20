@@ -51,7 +51,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID).</div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v1.2</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -167,7 +167,8 @@ function onEvent(event, args){
 /* ===================== Maquettes et versions ===================== */
 async function refreshModels(){
   const sel = $("model");
-  const models = (await API.viewer.getModels()) || [];
+  const raw = await API.viewer.getModels();
+  const models = Array.isArray(raw) ? raw : [];
   const loaded = models.filter(m => m.state === "loaded");
   const pool = loaded.length ? loaded : models;
   const prev = sel.value;
@@ -201,7 +202,7 @@ async function loadVersions(){
   status("Lecture de l'historique des versions…");
   try{
     let versions = await coreFetch(`/files/${encodeURIComponent(id)}/versions`);
-    versions = (Array.isArray(versions) ? versions : versions.items || [])
+    versions = (Array.isArray(versions) ? versions : (versions && Array.isArray(versions.items) ? versions.items : []))
       .sort((a,b)=> new Date(b.createdOn||b.modifiedOn) - new Date(a.createdOn||a.modifiedOn));
     if (versions.length < 2){ status("Cette maquette n'a qu'une seule version : rien à comparer."); vA.innerHTML=vB.innerHTML=""; return; }
     const opt = (v,i) => {
@@ -233,7 +234,7 @@ async function loadVersion(modelId, versionId){
       for (let i=0;i<20;i++){
         let o = null;
         try { o = await API.viewer.getObjects({ modelObjectIds:[{ modelId }] }); } catch(e){ if (!isTimeout(e)) throw e; }
-        const n = (o||[]).reduce((s,x)=>s+(x.objects?.length||0),0);
+        const n = idsFrom(o, modelId).length;
         if (n > 0) return;
         await sleep(1000);
       }
@@ -256,10 +257,24 @@ async function guidsFor(modelId, ids){
   }
 }
 
+function idsFrom(mo, modelId){
+  const arr = Array.isArray(mo) ? mo : (mo ? [mo] : []);
+  const pick = list => list.flatMap(x => Array.isArray(x?.objects) ? x.objects.map(o => (typeof o === "number" ? o : o?.id)) : [])
+                           .filter(v => v !== undefined && v !== null);
+  let ids = pick(arr.filter(x => x && x.modelId === modelId));
+  if (!ids.length && arr.length === 1) ids = pick(arr);   // identifiant de maquette renvoyé sous une autre forme
+  return [...new Set(ids)];
+}
+async function listObjectIds(modelId, label){
+  let ids = idsFrom(await retry(label, () => API.viewer.getObjects({ modelObjectIds:[{ modelId }] })), modelId);
+  if (!ids.length) ids = idsFrom(await retry(label, () => API.viewer.getObjects()), modelId);
+  return ids;
+}
+
 function flatten(props, ignore){
   const out = {};
-  for (const set of props || []){
-    for (const p of set.properties || []){
+  for (const set of (Array.isArray(props) ? props : [])){
+    for (const p of (Array.isArray(set?.properties) ? set.properties : [])){
       if (ignore.has(String(p.name).toLowerCase())) continue;
       out[`${set.name} › ${p.name}`] = p.value;
     }
@@ -274,8 +289,8 @@ async function snapshot(modelId, label, onP){
   const r = v => Math.round(v / tolM);
 
   step = "inventaire des objets (" + label + ")";
-  const mo = await retry(label, () => API.viewer.getObjects({ modelObjectIds:[{ modelId }] }));
-  const ids = (mo||[]).filter(x=>x.modelId===modelId).flatMap(x=>x.objects.map(o=>o.id));
+  const ids = await listObjectIds(modelId, label);
+  if (!ids.length) throw new Error("La vue 3D ne renvoie aucun objet pour cette maquette. Vérifie qu'elle est bien affichée (œil activé) puis réessaie.");
   const map = new Map();
   let noGuid = 0;
 
@@ -292,15 +307,16 @@ async function snapshot(modelId, label, onP){
       if (isTimeout(e) && size > 1){ size = Math.max(1, Math.floor(size/2)); onP && onP(i/ids.length, label + " : paquets réduits à " + size + " objets…"); continue; }
       throw e;
     }
-    const pById = new Map((props||[]).map(p=>[p.id,p]));
-    const bById = new Map((boxes||[]).map(b=>[b.id,b]));
+    guids = Array.isArray(guids) ? guids : [];
+    const pById = new Map((Array.isArray(props)?props:[]).filter(Boolean).map(p=>[p.id,p]));
+    const bById = new Map((Array.isArray(boxes)?boxes:[]).filter(Boolean).map(b=>[b.id,b]));
     chunk.forEach((rid, k) => {
       const guid = guids[k];
       if (!guid){ noGuid++; return; }
       const p = pById.get(rid) || {};
       const flat = flatten(p.properties, ignore);
       const bb = bById.get(rid)?.boundingBox;
-      const geo = bb ? [bb.min.x,bb.min.y,bb.min.z,bb.max.x,bb.max.y,bb.max.z].map(r).join(",") : "";
+      const geo = (bb && bb.min && bb.max) ? [bb.min.x,bb.min.y,bb.min.z,bb.max.x,bb.max.y,bb.max.z].map(r).join(",") : "";
       const keys = Object.keys(flat).sort();
       map.set(guid, {
         guid, rid,
@@ -475,12 +491,13 @@ $("refresh").onclick = () => refreshModels();
 $("model").onchange = () => loadVersions();
 $("run").onclick = run;
 $("reset").onclick = async () => { await API.viewer.setObjectState(undefined, { color:"reset", visible:"reset" }); status("Vue réinitialisée."); };
-$("showA").onclick = () => switchTo("A").catch(e=>status(e.message,true));
-$("showB").onclick = () => switchTo("B").catch(e=>status(e.message,true));
+const fail = e => status("Erreur pendant « " + (step || "affichage") + " » : " + (e.message || e), true);
+$("showA").onclick = () => switchTo("A").catch(fail);
+$("showB").onclick = () => switchTo("B").catch(fail);
 $("csv").onclick = exportCsv;
 $("filter").oninput = renderList;
 $("isolate").onchange = () => paint(loadedSide);
-$("list").onclick = e => { const it = e.target.closest(".item"); if (it) focusRow(it).catch(err=>status(err.message,true)); };
+$("list").onclick = e => { const it = e.target.closest(".item"); if (it) focusRow(it).catch(fail); };
 document.querySelectorAll(".stat").forEach(b => b.onclick = async () => {
   activeCat = activeCat === b.dataset.k ? null : b.dataset.k;
   renderResults();
