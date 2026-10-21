@@ -51,7 +51,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v1.3</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v1.5</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -72,6 +72,9 @@
       <input type="text" id="ignore" placeholder="aucune">
       <label for="tol">Tolérance géométrique (mm)</label>
       <input type="text" id="tol" value="1">
+      <label class="chk"><input type="checkbox" id="geomatch" checked> Si les GUID diffèrent, apparier les objets par géométrie</label>
+      <label for="near">Distance max. pour un objet déplacé (mm)</label>
+      <input type="text" id="near" value="100">
     </details>
 
     <div class="btns">
@@ -110,6 +113,8 @@ const API_TIMEOUT = 300000;        // 5 min par appel vers la vue 3D
 const LOAD_TIMEOUT = 10 * 60e3;    // 10 min max pour charger une version
 // conteneurs (projet, site, bâtiment, niveau…) : exclus, sinon les colorer colore toute la maquette
 const SPATIAL = /^ifc(project|site|building|buildingstorey|space|zone|spatialzone|facility|facilitypart|bridge|bridgepart|road|roadpart|railway|railwaypart|tunnel|tunnelpart|marinefacility|grid|annotation|group|systemfurniture|distributionsystem|system)$/i;
+// propriétés d'identité qui changent quand les GUID sont régénérés : ignorées pour les paires géométriques
+const ID_PROP = /›\s*(guid|globalid|global id|ifc ?guid|ifcguid|tekla ?guid|unique ?id|uniqueid|id|element ?id|elementid|tag|batid|bat ?id)$/i;
 const COLORS = {
   added:  "#1E8A44",
   deleted:"#DA212C",
@@ -278,6 +283,43 @@ async function listObjectIds(modelId, label){
   return ids;
 }
 
+// Descend dans les assemblages / conteneurs pour récupérer les objets enfants
+const HIER = [4, 2, 3, 1]; // ElementAssembly, SpatialContainment, Containment, SpatialHierarchy
+async function expandHierarchy(modelId, topIds, label, onP){
+  const all = new Set(topIds), parents = new Set();
+  let frontier = [...topIds];
+  for (let depth = 0; depth < 8 && frontier.length; depth++){
+    const found = new Set();
+    for (let i = 0; i < frontier.length; i += CHUNK){
+      const chunk = frontier.slice(i, i + CHUNK);
+      for (const t of HIER){
+        let kids = [];
+        try { kids = await API.viewer.getHierarchyChildren(modelId, chunk, t, false) || []; }
+        catch(e){ if (isTimeout(e)) throw e; continue; }
+        for (const k of kids){
+          if (k && typeof k.id === "number" && !all.has(k.id)){ found.add(k.id); }
+        }
+        if (kids.length && chunk.length === 1) parents.add(chunk[0]);
+      }
+      onP && onP(0, `${label} : hiérarchie, ${all.size + found.size} objets trouvés…`);
+    }
+    // marque comme parents les objets du niveau courant qui ont des enfants
+    if (found.size){
+      for (const id of frontier){
+        for (const t of HIER){
+          let kids = [];
+          try { kids = await API.viewer.getHierarchyChildren(modelId, [id], t, false) || []; } catch(e){ if (isTimeout(e)) throw e; continue; }
+          if (kids.length){ parents.add(id); break; }
+        }
+        if (frontier.length > 2000) break; // évite des milliers d'appels sur les très grosses maquettes
+      }
+    }
+    found.forEach(id => all.add(id));
+    frontier = [...found];
+  }
+  return { ids: [...all], parents };
+}
+
 function flatten(props, ignore){
   const out = {};
   for (const set of (Array.isArray(props) ? props : [])){
@@ -296,7 +338,9 @@ async function snapshot(modelId, label, onP){
   const r = v => Math.round(v / tolM);
 
   step = "inventaire des objets (" + label + ")";
-  const ids = await listObjectIds(modelId, label);
+  const top = await listObjectIds(modelId, label);
+  step = "lecture de la hiérarchie (" + label + ")";
+  const { ids, parents } = await expandHierarchy(modelId, top, label, onP);
   if (!ids.length) throw new Error("La vue 3D ne renvoie aucun objet pour cette maquette. Vérifie qu'elle est bien affichée (œil activé) puis réessaie.");
   const map = new Map();
   let noGuid = 0, spatial = 0;
@@ -321,7 +365,7 @@ async function snapshot(modelId, label, onP){
       const guid = guids[k];
       if (!guid){ noGuid++; return; }
       const p = pById.get(rid) || {};
-      if (SPATIAL.test(p.class || "")){ spatial++; return; }
+      if (SPATIAL.test(p.class || "") || parents.has(rid)){ spatial++; return; }
       const flat = flatten(p.properties, ignore);
       const bb = bById.get(rid)?.boundingBox;
       const geo = (bb && bb.min && bb.max) ? [bb.min.x,bb.min.y,bb.min.z,bb.max.x,bb.max.y,bb.max.z].map(r).join(",") : "";
@@ -331,7 +375,9 @@ async function snapshot(modelId, label, onP){
         name: p.product?.name || flat["Element › Name"] || flat[keys.find(k=>/›\s*name$/i.test(k))] || p.class || "(sans nom)",
         cls: p.class || "",
         geo,
+        bb: (bb && bb.min && bb.max) ? [bb.min.x,bb.min.y,bb.min.z,bb.max.x,bb.max.y,bb.max.z] : null,
         ph: hashStr(keys.map(k=>k+"="+flat[k]).join("|")),
+        phNoId: hashStr(keys.filter(k=>!ID_PROP.test(k)).map(k=>k+"="+flat[k]).join("|")),
         flat
       });
     });
@@ -342,22 +388,71 @@ async function snapshot(modelId, label, onP){
 }
 
 /* ===================== Comparaison ===================== */
-function compare(A, B){
-  const d = { added:[], deleted:[], geom:[], props:[], same:[] };
+function compare(A, B, opts = {}){
+  const d = { added:[], deleted:[], geom:[], props:[], same:[], byGuid:0, byGeo:0 };
+  const pushPair = (a, b, viaGeo) => {
+    const ph = viaGeo ? [a.phNoId, b.phNoId] : [a.ph, b.ph];
+    const x = { a, b, viaGeo };
+    if (a.geo !== b.geo) d.geom.push(x);
+    else if (ph[0] !== ph[1]) d.props.push(x);
+    else d.same.push(x);
+    viaGeo ? d.byGeo++ : d.byGuid++;
+  };
+  let restB = [];
   for (const [g,b] of B.map){
     const a = A.map.get(g);
-    if (!a) d.added.push({ b });
-    else if (a.geo !== b.geo) d.geom.push({ a, b });
-    else if (a.ph !== b.ph) d.props.push({ a, b });
-    else d.same.push({ a, b });
+    if (a) pushPair(a, b, false); else restB.push(b);
   }
-  for (const [g,a] of A.map) if (!B.map.has(g)) d.deleted.push({ a });
+  let restA = [];
+  for (const [g,a] of A.map) if (!B.map.has(g)) restA.push(a);
+
+  if (opts.geoMatch && restA.length && restB.length){
+    // 1) emprise identique (à la tolérance près) + même classe
+    const byKey = new Map();
+    for (const a of restA){ if (!a.geo) continue; const k = a.cls + "|" + a.geo; (byKey.get(k) || byKey.set(k, []).get(k)).push(a); }
+    const usedA = new Set(), leftB = [];
+    for (const b of restB){
+      const arr = b.geo ? byKey.get(b.cls + "|" + b.geo) : null;
+      const a = arr && arr.find(x => !usedA.has(x));
+      if (a){ usedA.add(a); pushPair(a, b, true); } else leftB.push(b);
+    }
+    restA = restA.filter(a => !usedA.has(a)); restB = leftB;
+
+    // 2) objet proche (centre à moins de "near" m, dimensions à ±20 %) + même classe -> géométrie modifiée
+    const near = opts.near || 0.1;
+    const cell = Math.max(near, 0.01);
+    const center = bb => [(bb[0]+bb[3])/2, (bb[1]+bb[4])/2, (bb[2]+bb[5])/2];
+    const dims = bb => [bb[3]-bb[0], bb[4]-bb[1], bb[5]-bb[2]];
+    const grid = new Map();
+    const ck = c => c.map(v => Math.floor(v / cell)).join(",");
+    for (const a of restA){ if (!a.bb) continue; const k = ck(center(a.bb)); (grid.get(k) || grid.set(k, []).get(k)).push(a); }
+    const used2 = new Set(), left2 = [];
+    for (const b of restB){
+      if (!b.bb){ left2.push(b); continue; }
+      const cb = center(b.bb), db = dims(b.bb), base = cb.map(v => Math.floor(v / cell));
+      let best = null, bestD = Infinity;
+      for (let dx=-1; dx<=1; dx++) for (let dy=-1; dy<=1; dy++) for (let dz=-1; dz<=1; dz++){
+        for (const a of grid.get([base[0]+dx, base[1]+dy, base[2]+dz].join(",")) || []){
+          if (used2.has(a) || a.cls !== b.cls) continue;
+          const ca = center(a.bb), da = dims(a.bb);
+          const dist = Math.hypot(ca[0]-cb[0], ca[1]-cb[1], ca[2]-cb[2]);
+          const sizeOk = da.every((v,i) => Math.abs(v - db[i]) <= Math.max(0.2 * Math.max(v, db[i]), 0.005));
+          if (dist <= near && sizeOk && dist < bestD){ best = a; bestD = dist; }
+        }
+      }
+      if (best){ used2.add(best); pushPair(best, b, true); } else left2.push(b);
+    }
+    restA = restA.filter(a => !used2.has(a)); restB = left2;
+  }
+  restB.forEach(b => d.added.push({ b }));
+  restA.forEach(a => d.deleted.push({ a }));
   return d;
 }
-function propDiff(a, b){
+function propDiff(a, b, viaGeo){
   const out = [];
   const keys = new Set([...Object.keys(a.flat), ...Object.keys(b.flat)]);
   for (const k of keys){
+    if (viaGeo && ID_PROP.test(k)) continue;
     const va = a.flat[k], vb = b.flat[k];
     if (String(va) !== String(vb)) out.push({ k, va, vb });
   }
@@ -416,17 +511,19 @@ async function run(){
     await loadVersion(modelId, vB); loadedSide = "B";
     snapB = await snapshot(modelId, "Version B", step(0.5, 0.45));
 
-    diff = compare(snapA, snapB);
+    const nearM = (parseFloat(String($("near").value).replace(",", ".")) || 100) / 1000;
+    diff = compare(snapA, snapB, { geoMatch: $("geomatch").checked, near: nearM });
     activeCat = null;
     renderResults();
     await paint("B");
     progress(null);
     const warn = (snapA.noGuid + snapB.noGuid) ? `\n${snapA.noGuid + snapB.noGuid} objets sans GUID ont été ignorés.` : "";
     const ratio = Math.min(snapA.map.size, snapB.map.size) / Math.max(1, Math.max(snapA.map.size, snapB.map.size));
-    const alert = (diff.same.length === 0 && snapA.map.size && snapB.map.size)
+    const alert = (diff.byGuid === 0 && diff.byGeo === 0 && snapA.map.size && snapB.map.size)
       ? "\n⚠ Aucun objet commun : les GUID ont probablement été régénérés à l'export (comparaison GUID non exploitable pour ces versions)."
       : (ratio < 0.2 ? "\n⚠ Écart de taille très important entre A et B : vérifie que les deux versions sont complètes." : "");
-    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn + alert);
+    const geoNote = diff.byGeo ? `\nGUID différents pour ${diff.byGeo} objets : appariés par géométrie (même classe, même emprise ou emprise voisine).` : "";
+    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn + geoNote + alert);
   }catch(e){
     progress(null);
     status("Erreur pendant « " + (step || "préparation") + " » : " + (e.message || e) + "\nAstuce : réessaie, ou teste d'abord une maquette plus légère.", true);
@@ -441,7 +538,8 @@ function renderResults(){
   for (const k of ["added","deleted","geom","props"]) $("n-"+k).textContent = diff[k].length;
   $("n-same").textContent = diff.same.length;
   $("summary").textContent = `Objets comparés : A = ${snapA.map.size}, B = ${snapB.map.size}` +
-    ` (conteneurs exclus : ${snapA.spatial}/${snapB.spatial}, sans GUID : ${snapA.noGuid}/${snapB.noGuid}).`;
+    ` (conteneurs exclus : ${snapA.spatial}/${snapB.spatial}, sans GUID : ${snapA.noGuid}/${snapB.noGuid}).` +
+    ` Appariés : ${diff.byGuid} par GUID, ${diff.byGeo} par géométrie.`;
   document.querySelectorAll(".stat").forEach(b => b.classList.toggle("on", b.dataset.k === activeCat));
   renderList();
 }
@@ -459,7 +557,7 @@ function renderList(){
   const html = rows.slice(0, MAX).map((r,i) => `
     <div class="item" data-i="${i}">
       <div class="n"><i class="dot" style="background:${COLORS[r.k]}"></i>${esc(r.o.name)}</div>
-      <div class="c">${esc(r.o.cls)} · ${esc(r.o.guid)}</div>
+      <div class="c">${esc(r.o.cls)} · ${esc(r.o.guid)}${r.x.viaGeo ? " · apparié par géométrie" : ""}</div>
     </div>`).join("");
   $("list").innerHTML = html + (rows.length > MAX ? `<div class="muted" style="padding:6px 2px">… ${rows.length - MAX} autres. Affine avec le filtre ou exporte le CSV.</div>` : "")
     + (rows.length ? "" : '<div class="muted" style="padding:6px 2px">Aucun élément.</div>');
@@ -476,7 +574,7 @@ async function focusRow(el){
   // détail des propriétés modifiées
   document.querySelectorAll(".diff").forEach(d=>d.remove());
   if (r.x.a && r.x.b){
-    const pd = propDiff(r.x.a, r.x.b);
+    const pd = propDiff(r.x.a, r.x.b, r.x.viaGeo);
     const box = document.createElement("div"); box.className = "diff";
     box.innerHTML = (r.k === "geom" ? "<div><b>Position / emprise modifiée</b></div>" : "")
       + (pd.length ? pd.slice(0,30).map(d=>`<div>${esc(d.k)} : <s>${esc(d.va ?? "—")}</s> → <ins>${esc(d.vb ?? "—")}</ins></div>`).join("") : '<div class="muted">Aucune propriété modifiée.</div>');
@@ -487,11 +585,12 @@ async function focusRow(el){
 function exportCsv(){
   const label = { added:"Ajouté", deleted:"Supprimé", geom:"Géométrie modifiée", props:"Propriétés modifiées" };
   const q = v => `"${String(v ?? "").replace(/"/g,'""')}"`;
-  const lines = [["Statut","GUID","Nom","Classe","Propriété","Valeur A","Valeur B"].map(q).join(";")];
+  const lines = [["Statut","GUID","Nom","Classe","Appariement","Propriété","Valeur A","Valeur B"].map(q).join(";")];
   for (const r of rowsFor(null)){
-    const pd = (r.x.a && r.x.b) ? propDiff(r.x.a, r.x.b) : [];
-    if (!pd.length) lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, "", "", ""].map(q).join(";"));
-    else pd.forEach(d => lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, d.k, d.va, d.vb].map(q).join(";")));
+    const pd = (r.x.a && r.x.b) ? propDiff(r.x.a, r.x.b, r.x.viaGeo) : [];
+    const how = (r.x.a && r.x.b) ? (r.x.viaGeo ? "Géométrie" : "GUID") : "";
+    if (!pd.length) lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, how, "", "", ""].map(q).join(";"));
+    else pd.forEach(d => lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, how, d.k, d.va, d.vb].map(q).join(";")));
   }
   const blob = new Blob(["﻿" + lines.join("\r\n")], { type:"text/csv;charset=utf-8" });
   const a = document.createElement("a");
