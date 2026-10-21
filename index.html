@@ -46,12 +46,19 @@
   .muted{color:var(--mute);font-size:12px}
   .chk{display:flex;gap:6px;align-items:center;font-size:12px;margin-top:8px;color:var(--ink)}
   .err{color:var(--del)}
+  .refs{max-height:120px;overflow:auto;border:1px solid var(--line);border-radius:3px;padding:4px 6px;background:#fff}
+  .refs label{display:flex;gap:6px;align-items:center;margin:2px 0;color:var(--ink);font-size:12px}
+  .seg{display:flex;margin-top:10px}
+  .seg button{flex:1;border-radius:0}
+  .seg button:first-child{border-radius:3px 0 0 3px}
+  .seg button:last-child{border-radius:0 3px 3px 0;border-left:none}
+  .seg button.on{background:var(--blue);color:#fff}
 </style>
 </head>
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v1.7</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v1.9</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -66,6 +73,9 @@
     <select id="vA" disabled></select>
     <label for="vB">Version B (nouvelle)</label>
     <select id="vB" disabled></select>
+
+    <label>Maquettes de référence <span class="muted">(restent affichées, sans couleur, ex. CFO)</span></label>
+    <div class="refs" id="refs"><span class="muted">Charge les maquettes de référence dans la vue 3D, elles apparaîtront ici.</span></div>
 
     <details style="margin-top:8px">
       <summary class="muted" style="cursor:pointer">Options</summary>
@@ -96,10 +106,13 @@
     </div>
     <div class="muted" style="margin-top:6px"><span id="n-same">0</span> objets inchangés (en gris).</div>
     <div class="muted" id="summary" style="margin-top:4px"></div>
+    <div class="seg">
+      <button id="showA">◀ Version A (avant)</button>
+      <button id="showB" class="on">Version B (après) ▶</button>
+    </div>
+    <div class="muted" style="margin-top:4px">La caméra reste fixe quand tu bascules : idéal pour contrôler une interface avec une maquette de référence.</div>
     <label class="chk"><input type="checkbox" id="isolate"> N'afficher que la catégorie sélectionnée</label>
     <div class="btns">
-      <button id="showA">Voir les supprimés (version A)</button>
-      <button id="showB">Revenir à la version B</button>
       <button id="csv">Exporter CSV</button>
     </div>
     <input type="text" id="filter" placeholder="Filtrer par nom, classe, GUID…" style="margin-top:10px">
@@ -116,6 +129,9 @@ const LOAD_TIMEOUT = 10 * 60e3;    // 10 min max pour charger une version
 const SPATIAL = /^ifc(project|site|building|buildingstorey|space|zone|spatialzone|facility|facilitypart|bridge|bridgepart|road|roadpart|railway|railwaypart|tunnel|tunnelpart|marinefacility|grid|annotation|group|systemfurniture|distributionsystem|system)$/i;
 // propriétés d'identité qui changent quand les GUID sont régénérés : ignorées pour les paires géométriques
 const ID_PROP = /›\s*(guid|globalid|global id|ifc ?guid|ifcguid|tekla ?guid|unique ?id|uniqueid|id|element ?id|elementid|tag|batid|bat ?id)$/i;
+// propriétés de quantité : un changement = géométrie modifiée (capte les trous / réservations qui ne changent pas l'emprise)
+const QTY_PROP = /›\s*(net|gross)?\s*(volume|side ?area|area|surface|aire|surface nette|surface brute|volume net|volume brut|footprint ?area|cross ?section ?area|perimeter|périmètre)$/i;
+const OPENING = /opening|ouverture|réservation|reservation/i;
 const COLORS = {
   added:  "#1E8A44",
   deleted:"#DA212C",
@@ -137,6 +153,7 @@ let snapA = null, snapB = null, diff = null, current = null;
 let activeCat = null, loadedSide = null;
 let allModels = [], loadedIds = new Set(), running = false;
 let hiddenOthers = [];
+const refIds = new Set();   // maquettes de référence gardées affichées
 const $ = id => document.getElementById(id);
 let step = "";
 const isTimeout = e => /timed out|timeout/i.test(String(e && (e.message || e)));
@@ -170,7 +187,14 @@ async function init(){
 }
 function onEvent(event, args){
   if (event === "viewer.onModelStateChanged" && !running){
-    clearTimeout(onEvent._t); onEvent._t = setTimeout(() => refreshModels().catch(()=>{}), 800);
+    clearTimeout(onEvent._t);
+    onEvent._t = setTimeout(async () => {
+      try{
+        await refreshModels();
+        // une maquette de référence vient d'être chargée : on réapplique les couleurs de la comparaison
+        if (current && loadedSide && loadedIds.has(current.modelId) && !running) await paint(loadedSide);
+      }catch(e){}
+    }, 1200);
     return;
   }
   if (event === "extension.accessToken"){
@@ -209,11 +233,27 @@ async function refreshModels(){
   // maquette affichée : la dernière chargée, sinon la première affichée
   const fresh = [...loadedIds].filter(id => !before.has(id));
   let target = prev;
-  if (fresh.length) target = fresh[fresh.length - 1];
+  if (current){
+    // comparaison en cours : la maquette comparée reste sélectionnée, les nouvelles maquettes deviennent des références
+    target = current.modelId;
+    fresh.filter(id => id !== current.modelId).forEach(id => { refIds.add(id); hiddenOthers = hiddenOthers.filter(x => x !== id); });
+  }
+  else if (fresh.length) target = fresh[fresh.length - 1];
   else if (!prev || !allModels.some(m => m.id === prev)) target = [...loadedIds][0] || "";
   renderModelOptions(target);
+  renderRefs();
   if (sel.value && sel.value !== prev) loadVersions();
   else if (sel.value && !$("vA").options.length) loadVersions();
+}
+
+function renderRefs(){
+  const box = $("refs");
+  const sel = current ? current.modelId : $("model").value;
+  const ids = new Set([...loadedIds, ...refIds, ...hiddenOthers]);
+  ids.delete(sel);
+  const list = allModels.filter(m => ids.has(m.id));
+  if (!list.length){ box.innerHTML = '<span class="muted">Charge les maquettes de référence dans la vue 3D, elles apparaîtront ici.</span>'; return; }
+  box.innerHTML = list.map(m => `<label><input type="checkbox" data-id="${esc(m.id)}" ${refIds.has(m.id) ? "checked" : ""}>${esc(m.name)}</label>`).join("");
 }
 
 function onSearch(){
@@ -265,9 +305,9 @@ async function loadVersions(){
 }
 
 /* ===================== Chargement d'une version ===================== */
-async function loadVersion(modelId, versionId){
+async function loadVersion(modelId, versionId, fit = true){
   step = "chargement de la version";
-  try { await API.viewer.toggleModelVersion({ id: modelId, versionId }, true, true); }
+  try { await API.viewer.toggleModelVersion({ id: modelId, versionId }, true, fit); }
   catch(e){ if (!isTimeout(e)) throw e; /* le chargement continue côté viewer : on surveille */ }
   const t0 = Date.now();
   while (Date.now() - t0 < LOAD_TIMEOUT){
@@ -415,13 +455,32 @@ async function snapshot(modelId, label, onP){
         bb: (bb && bb.min && bb.max) ? [bb.min.x,bb.min.y,bb.min.z,bb.max.x,bb.max.y,bb.max.z] : null,
         ph: hashStr(keys.map(k=>k+"="+flat[k]).join("|")),
         phNoId: hashStr(keys.filter(k=>!ID_PROP.test(k)).map(k=>k+"="+flat[k]).join("|")),
+        qh: hashStr(keys.filter(k=>QTY_PROP.test(k)).map(k=>{ const v = parseFloat(String(flat[k]).replace(",", ".")); return k+"="+(isFinite(v) ? v.toPrecision(4) : flat[k]); }).join("|")),
+        osig: "",
         flat
       });
     });
     i += chunk.length;
     onP && onP(Math.min(1,i/ids.length), `${label} : ${i} / ${ids.length} objets lus`);
   }
-  return { map, total: ids.length, noGuid, spatial };
+  // réservations : on rattache chaque ouverture à son hôte (mur, dalle…) pour détecter un trou ajouté / déplacé
+  const byRid = new Map([...map.values()].map(o => [o.rid, o]));
+  const openings = [...map.values()].filter(o => OPENING.test(o.cls));
+  let nOpen = 0;
+  for (let i = 0; i < openings.length; i += 6){
+    step = "lecture des réservations (" + label + ")";
+    await Promise.all(openings.slice(i, i + 6).map(async op => {
+      let hosts = [];
+      try { hosts = await API.viewer.getHierarchyParents(modelId, [op.rid], 8, false) || []; } catch(e){ if (isTimeout(e)) throw e; }
+      for (const h of hosts){
+        const host = byRid.get(h.id);
+        if (host){ (host._ops = host._ops || []).push(op.geo || op.guid); op.hostRid = host.rid; nOpen++; }
+      }
+    }));
+    onP && onP(1, `${label} : réservations ${Math.min(i + 6, openings.length)} / ${openings.length}`);
+  }
+  for (const o of map.values()) if (o._ops){ o.osig = hashStr(o._ops.sort().join("|")); o.nOps = o._ops.length; delete o._ops; }
+  return { map, total: ids.length, noGuid, spatial, openings: openings.length, hosted: nOpen };
 }
 
 /* ===================== Comparaison ===================== */
@@ -429,8 +488,15 @@ function compare(A, B, opts = {}){
   const d = { added:[], deleted:[], geom:[], props:[], same:[], byGuid:0, byGeo:0 };
   const pushPair = (a, b, viaGeo) => {
     const ph = viaGeo ? [a.phNoId, b.phNoId] : [a.ph, b.ph];
-    const x = { a, b, viaGeo };
-    if (a.geo !== b.geo) d.geom.push(x);
+    const why = [];
+    if (a.geo !== b.geo) why.push("emprise / position");
+    if ((a.osig || "") !== (b.osig || "")){
+      const na = a.nOps || 0, nb = b.nOps || 0;
+      why.push(na === nb ? `réservation(s) déplacée(s) ou redimensionnée(s) (${nb})` : `réservations ${na} → ${nb}`);
+    }
+    if (a.qh !== b.qh) why.push("quantités (volume / surface)");
+    const x = { a, b, viaGeo, why };
+    if (why.length) d.geom.push(x);
     else if (ph[0] !== ph[1]) d.props.push(x);
     else d.same.push(x);
     viaGeo ? d.byGeo++ : d.byGuid++;
@@ -506,9 +572,9 @@ async function fitModel(){
 async function paint(side){
   step = "coloration";
   const modelId = current.modelId;
-  await API.viewer.setObjectState(undefined, { color: "reset", visible: "reset" });
+  await API.viewer.setObjectState(sel(modelId), { color: "reset", visible: "reset" });
   await API.viewer.setObjectState(sel(modelId), { color: COLORS.ghost });
-  const cats = side === "A" ? ["deleted"] : ["added","geom","props"];
+  const cats = side === "A" ? ["deleted","geom","props"] : ["added","geom","props"];
   const iso = $("isolate").checked && activeCat;
   if (iso && cats.includes(activeCat)){
     await API.viewer.setObjectState(sel(modelId), { visible: false });
@@ -525,13 +591,23 @@ async function paint(side){
 
 async function switchTo(side){
   const vid = side === "A" ? current.vA : current.vB;
-  if (loadedSide !== side){
-    status(`Chargement de la version ${side}…`);
-    await loadVersion(current.modelId, vid);
-    loadedSide = side;
-  }
-  await paint(side);
-  status(side === "A" ? "Version A affichée : objets supprimés en rouge." : "Version B affichée : ajoutés en vert, géométrie modifiée en orange, propriétés seules en bleu.");
+  $("showA").classList.toggle("on", side === "A");
+  $("showB").classList.toggle("on", side === "B");
+  running = true;
+  try{
+    if (loadedSide !== side){
+      status(`Chargement de la version ${side}…`);
+      let cam = null;
+      try { cam = await API.viewer.getCamera(); } catch(e){}
+      await loadVersion(current.modelId, vid, false);
+      loadedSide = side;
+      if (cam){ try { await API.viewer.setCamera(cam, { animationTime: 0 }); } catch(e){} }
+    }
+    await paint(side);
+  } finally { running = false; }
+  status(side === "A"
+    ? "Version A (avant) : supprimés en rouge, anciennes positions des objets modifiés en orange, propriétés modifiées en bleu."
+    : "Version B (après) : ajoutés en vert, géométrie modifiée en orange, propriétés seules en bleu.");
 }
 
 /* ===================== Lancement ===================== */
@@ -542,11 +618,13 @@ async function run(){
   running = true;
   try{
     // n'afficher que la maquette comparée : les autres sont déchargées (rétablies par « Réinitialiser la vue »)
-    const others = [...loadedIds].filter(id => id !== modelId);
+    const others = [...loadedIds].filter(id => id !== modelId && !refIds.has(id));
+    refIds.delete(modelId);
     if (others.length){
       step = "masquage des autres maquettes";
       try { await API.viewer.toggleModel(others, false, false); } catch(e){ if (!isTimeout(e)) throw e; }
       hiddenOthers = [...new Set([...hiddenOthers, ...others])];
+      others.forEach(id => loadedIds.delete(id));
     }
     current = { modelId, vA, vB, name: $("model").selectedOptions[0].textContent,
                 labelA: $("vA").selectedOptions[0].textContent, labelB: $("vB").selectedOptions[0].textContent };
@@ -566,6 +644,8 @@ async function run(){
     renderResults();
     await paint("B");
     await fitModel();
+    $("showA").classList.remove("on"); $("showB").classList.add("on");
+    renderRefs();
     progress(null);
     const warn = (snapA.noGuid + snapB.noGuid) ? `\n${snapA.noGuid + snapB.noGuid} objets sans GUID ont été ignorés.` : "";
     const ratio = Math.min(snapA.map.size, snapB.map.size) / Math.max(1, Math.max(snapA.map.size, snapB.map.size));
@@ -573,8 +653,13 @@ async function run(){
       ? "\n⚠ Aucun objet commun : les GUID ont probablement été régénérés à l'export (comparaison GUID non exploitable pour ces versions)."
       : (ratio < 0.2 ? "\n⚠ Écart de taille très important entre A et B : vérifie que les deux versions sont complètes." : "");
     const geoNote = diff.byGeo ? `\nGUID différents pour ${diff.byGeo} objets : appariés par géométrie (même classe, même emprise ou emprise voisine).` : "";
-    const hidNote = hiddenOthers.length ? `\n${hiddenOthers.length} autre(s) maquette(s) masquée(s) pendant la comparaison (« Réinitialiser la vue » pour les réafficher).` : "";
-    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn + geoNote + hidNote + alert);
+    const nRef = [...refIds].filter(id => loadedIds.has(id)).length;
+    const hidNote = (hiddenOthers.length ? `\n${hiddenOthers.length} autre(s) maquette(s) masquée(s) (« Réinitialiser la vue » pour les réafficher).` : "")
+      + (nRef ? `\n${nRef} maquette(s) de référence affichée(s) sans couleur.` : "");
+    const opNote = (snapA.openings + snapB.openings) ? "\nRéservations (IfcOpeningElement) masquées par défaut dans Trimble Connect : œil ▾ de la barre d'outils → « IFC Opening Elements » pour les voir." : "";
+    const qty = [...snapB.map.values()].some(o => o.qh !== hashStr(""));
+    const qtyNote = qty ? "" : "\nAucune quantité (volume/surface) dans cette maquette : un trou modélisé sans ouverture IFC ne sera pas détecté. Demander l'export IFC avec les quantités de base.";
+    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn + geoNote + hidNote + opNote + qtyNote + alert);
   }catch(e){
     progress(null);
     status("Erreur pendant « " + (step || "préparation") + " » : " + (e.message || e) + "\nAstuce : réessaie, ou teste d'abord une maquette plus légère.", true);
@@ -591,7 +676,8 @@ function renderResults(){
   $("n-same").textContent = diff.same.length;
   $("summary").textContent = `Objets comparés : A = ${snapA.map.size}, B = ${snapB.map.size}` +
     ` (conteneurs exclus : ${snapA.spatial}/${snapB.spatial}, sans GUID : ${snapA.noGuid}/${snapB.noGuid}).` +
-    ` Appariés : ${diff.byGuid} par GUID, ${diff.byGeo} par géométrie.`;
+    ` Appariés : ${diff.byGuid} par GUID, ${diff.byGeo} par géométrie.` +
+    ` Réservations lues : ${snapA.openings}/${snapB.openings} (rattachées à un hôte : ${snapA.hosted}/${snapB.hosted}).`;
   document.querySelectorAll(".stat").forEach(b => b.classList.toggle("on", b.dataset.k === activeCat));
   renderList();
 }
@@ -609,7 +695,7 @@ function renderList(){
   const html = rows.slice(0, MAX).map((r,i) => `
     <div class="item" data-i="${i}">
       <div class="n"><i class="dot" style="background:${COLORS[r.k]}"></i>${esc(r.o.name)}</div>
-      <div class="c">${esc(r.o.cls)} · ${esc(r.o.guid)}${r.x.viaGeo ? " · apparié par géométrie" : ""}</div>
+      <div class="c">${esc(r.o.cls)} · ${esc(r.o.guid)}${r.x.viaGeo ? " · apparié par géométrie" : ""}${r.k === "geom" && r.x.why ? " · " + esc(r.x.why.join(", ")) : ""}</div>
     </div>`).join("");
   $("list").innerHTML = html + (rows.length > MAX ? `<div class="muted" style="padding:6px 2px">… ${rows.length - MAX} autres. Affine avec le filtre ou exporte le CSV.</div>` : "")
     + (rows.length ? "" : '<div class="muted" style="padding:6px 2px">Aucun élément.</div>');
@@ -621,14 +707,18 @@ async function focusRow(el){
   const side = r.k === "deleted" ? "A" : "B";
   if (loadedSide !== side) await switchTo(side);
   const s = sel(current.modelId, [ (side === "A" ? (r.x.a) : (r.x.b)).rid ]);
-  await API.viewer.setSelection(s, "set");
-  await API.viewer.setCamera(s, { animationTime: 400 });
+  const o = side === "A" ? r.x.a : r.x.b;
+  const rids = [o.rid].concat(o.hostRid ? [o.hostRid] : []);
+  const s2 = sel(current.modelId, rids);
+  await API.viewer.setSelection(s2, "set");
+  await API.viewer.setCamera(s2, { animationTime: 400 });
+  if (OPENING.test(o.cls)) status("Réservation sélectionnée avec son mur / sa dalle hôte. Si elle reste invisible : œil ▾ de la barre d'outils → « IFC Opening Elements ».");
   // détail des propriétés modifiées
   document.querySelectorAll(".diff").forEach(d=>d.remove());
   if (r.x.a && r.x.b){
     const pd = propDiff(r.x.a, r.x.b, r.x.viaGeo);
     const box = document.createElement("div"); box.className = "diff";
-    box.innerHTML = (r.k === "geom" ? "<div><b>Position / emprise modifiée</b></div>" : "")
+    box.innerHTML = (r.k === "geom" ? `<div><b>Géométrie modifiée : ${esc((r.x.why || []).join(", "))}</b></div>` : "")
       + (pd.length ? pd.slice(0,30).map(d=>`<div>${esc(d.k)} : <s>${esc(d.va ?? "—")}</s> → <ins>${esc(d.vb ?? "—")}</ins></div>`).join("") : '<div class="muted">Aucune propriété modifiée.</div>');
     el.appendChild(box);
   }
@@ -637,12 +727,13 @@ async function focusRow(el){
 function exportCsv(){
   const label = { added:"Ajouté", deleted:"Supprimé", geom:"Géométrie modifiée", props:"Propriétés modifiées" };
   const q = v => `"${String(v ?? "").replace(/"/g,'""')}"`;
-  const lines = [["Statut","GUID","Nom","Classe","Appariement","Propriété","Valeur A","Valeur B"].map(q).join(";")];
+  const lines = [["Statut","GUID","Nom","Classe","Appariement","Motif","Propriété","Valeur A","Valeur B"].map(q).join(";")];
   for (const r of rowsFor(null)){
     const pd = (r.x.a && r.x.b) ? propDiff(r.x.a, r.x.b, r.x.viaGeo) : [];
     const how = (r.x.a && r.x.b) ? (r.x.viaGeo ? "Géométrie" : "GUID") : "";
-    if (!pd.length) lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, how, "", "", ""].map(q).join(";"));
-    else pd.forEach(d => lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, how, d.k, d.va, d.vb].map(q).join(";")));
+    const why = (r.x.why || []).join(", ");
+    if (!pd.length) lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, how, why, "", "", ""].map(q).join(";"));
+    else pd.forEach(d => lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, how, why, d.k, d.va, d.vb].map(q).join(";")));
   }
   const blob = new Blob(["﻿" + lines.join("\r\n")], { type:"text/csv;charset=utf-8" });
   const a = document.createElement("a");
@@ -653,7 +744,17 @@ function exportCsv(){
 
 /* ===================== Événements ===================== */
 $("refresh").onclick = () => refreshModels();
-$("model").onchange = () => loadVersions();
+$("model").onchange = () => { renderRefs(); loadVersions(); };
+$("refs").onchange = async e => {
+  const id = e.target?.dataset?.id; if (!id) return;
+  if (e.target.checked){
+    refIds.add(id);
+    if (!loadedIds.has(id)){ try { await API.viewer.toggleModel(id, true, false); hiddenOthers = hiddenOthers.filter(x => x !== id); } catch(err){} }
+  } else {
+    refIds.delete(id);
+    if (current && loadedIds.has(id)){ try { await API.viewer.toggleModel(id, false, false); hiddenOthers.push(id); loadedIds.delete(id); } catch(err){} }
+  }
+};
 $("search").oninput = onSearch;
 $("search").onkeydown = e => { if (e.key === "Enter"){ const o = [...$("model").options].find(o => o.value); if (o && !$("model").value){ $("model").value = o.value; loadVersions(); } } };
 
@@ -661,9 +762,11 @@ $("run").onclick = run;
 $("reset").onclick = async () => {
   try{
     await API.viewer.setObjectState(undefined, { color:"reset", visible:"reset" });
+    current = null; loadedSide = null; $("results").style.display = "none";
     const n = hiddenOthers.length;
     if (n){ try { await API.viewer.toggleModel(hiddenOthers, true, false); } catch(e){ if (!isTimeout(e)) throw e; } hiddenOthers = []; }
-    status("Vue réinitialisée." + (n ? ` ${n} maquette(s) réaffichée(s).` : ""));
+    status("Vue réinitialisée." + (n ? ` ${n} maquette(s) réaffichée(s).` : "") + " Tu peux choisir une autre maquette à comparer.");
+    renderRefs();
   }catch(e){ fail(e); }
 };
 const fail = e => status("Erreur pendant « " + (step || "affichage") + " » : " + (e.message || e), true);
