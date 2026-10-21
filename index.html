@@ -51,7 +51,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v1.5</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v1.6</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -59,7 +59,8 @@
       <select id="model"><option value="">Chargement…</option></select>
       <button id="refresh" title="Rafraîchir la liste" style="flex:0 0 auto">↻</button>
     </div>
-    <div class="muted" style="margin-top:4px">Charge d'abord la maquette dans la vue 3D pour qu'elle apparaisse ici.</div>
+    <input type="search" id="search" placeholder="🔍 Rechercher une maquette par son nom…" autocomplete="off" style="margin-top:6px">
+    <div class="muted" id="searchInfo" style="margin-top:4px">La maquette affichée dans la vue 3D est sélectionnée automatiquement (●).</div>
 
     <label for="vA">Version A (ancienne)</label>
     <select id="vA" disabled></select>
@@ -97,6 +98,7 @@
     <div class="muted" id="summary" style="margin-top:4px"></div>
     <label class="chk"><input type="checkbox" id="isolate"> N'afficher que la catégorie sélectionnée</label>
     <div class="btns">
+      <button id="toggleDel">Masquer les éléments supprimés de la vue</button>
       <button id="showA">Voir les supprimés (version A)</button>
       <button id="showB">Revenir à la version B</button>
       <button id="csv">Exporter CSV</button>
@@ -134,6 +136,9 @@ const HOSTS = {
 let API = null, token = null, project = null;
 let snapA = null, snapB = null, diff = null, current = null;
 let activeCat = null, loadedSide = null;
+let allModels = [], loadedIds = new Set(), running = false;
+let hiddenOthers = [], showDeleted = true, deletedMarkupIds = [];
+const MAX_DEL_BOXES = 2000;
 const $ = id => document.getElementById(id);
 let step = "";
 const isTimeout = e => /timed out|timeout/i.test(String(e && (e.message || e)));
@@ -166,6 +171,10 @@ async function init(){
   await refreshModels();
 }
 function onEvent(event, args){
+  if (event === "viewer.onModelStateChanged" && !running){
+    clearTimeout(onEvent._t); onEvent._t = setTimeout(() => refreshModels().catch(()=>{}), 800);
+    return;
+  }
   if (event === "extension.accessToken"){
     const v = args && args.data !== undefined ? args.data : args;
     if (v && v !== "pending" && v !== "denied"){ token = v; if ($("model").value) loadVersions(); }
@@ -173,18 +182,48 @@ function onEvent(event, args){
 }
 
 /* ===================== Maquettes et versions ===================== */
+const norm = t => String(t || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+
+function renderModelOptions(keepValue){
+  const sel = $("model");
+  const q = norm($("search").value.trim());
+  const terms = q.split(/\s+/).filter(Boolean);
+  const match = m => terms.every(t => norm(m.name).includes(t));
+  const list = allModels.filter(m => !terms.length || match(m) || m.id === keepValue);
+  const ordered = [...list.filter(m => loadedIds.has(m.id)), ...list.filter(m => !loadedIds.has(m.id))];
+  sel.innerHTML = '<option value="">— Choisir une maquette —</option>' +
+    ordered.map(m => `<option value="${esc(m.id)}">${loadedIds.has(m.id) ? "● " : ""}${esc(m.name)}</option>`).join("");
+  if (keepValue && ordered.some(m => m.id === keepValue)) sel.value = keepValue;
+  const n = allModels.filter(m => !terms.length || match(m)).length;
+  $("searchInfo").textContent = terms.length
+    ? `${n} maquette(s) trouvée(s) sur ${allModels.length}.` + (n === 0 ? " Ouvre le dossier dans la vue 3D puis ↻ si elle n'apparaît pas." : "")
+    : "La maquette affichée dans la vue 3D est sélectionnée automatiquement (●).";
+  return ordered.filter(m => !terms.length || match(m));
+}
+
 async function refreshModels(){
   const sel = $("model");
   const raw = await API.viewer.getModels();
-  const models = Array.isArray(raw) ? raw : [];
-  const loaded = models.filter(m => m.state === "loaded");
-  const pool = loaded.length ? loaded : models;
+  allModels = (Array.isArray(raw) ? raw : []).sort((a,b) => String(a.name).localeCompare(String(b.name), "fr"));
+  const before = loadedIds;
+  loadedIds = new Set(allModels.filter(m => m.state === "loaded").map(m => m.id));
   const prev = sel.value;
-  sel.innerHTML = pool.length
-    ? '<option value="">— Choisir une maquette —</option>' + pool.map(m=>`<option value="${esc(m.id)}">${esc(m.name)}</option>`).join("")
-    : '<option value="">Aucune maquette chargée dans la vue 3D</option>';
-  if (prev && pool.some(m=>m.id===prev)) sel.value = prev;
-  if (sel.value) loadVersions();
+  // maquette affichée : la dernière chargée, sinon la première affichée
+  const fresh = [...loadedIds].filter(id => !before.has(id));
+  let target = prev;
+  if (fresh.length) target = fresh[fresh.length - 1];
+  else if (!prev || !allModels.some(m => m.id === prev)) target = [...loadedIds][0] || "";
+  renderModelOptions(target);
+  if (sel.value && sel.value !== prev) loadVersions();
+  else if (sel.value && !$("vA").options.length) loadVersions();
+}
+
+function onSearch(){
+  const hits = renderModelOptions($("model").value);
+  const q = norm($("search").value.trim());
+  const exact = hits.find(m => norm(m.name) === q);
+  const pick = exact || (hits.length === 1 ? hits[0] : null);
+  if (pick && $("model").value !== pick.id){ $("model").value = pick.id; loadVersions(); }
 }
 
 async function coreFetch(path){
@@ -230,7 +269,7 @@ async function loadVersions(){
 /* ===================== Chargement d'une version ===================== */
 async function loadVersion(modelId, versionId){
   step = "chargement de la version";
-  try { await API.viewer.toggleModelVersion({ id: modelId, versionId }, true, false); }
+  try { await API.viewer.toggleModelVersion({ id: modelId, versionId }, true, true); }
   catch(e){ if (!isTimeout(e)) throw e; /* le chargement continue côté viewer : on surveille */ }
   const t0 = Date.now();
   while (Date.now() - t0 < LOAD_TIMEOUT){
@@ -462,6 +501,33 @@ function propDiff(a, b, viaGeo){
 /* ===================== Coloration ===================== */
 const sel = (modelId, rids) => ({ modelObjectIds:[{ modelId, objectRuntimeIds: rids }] });
 
+async function clearDeletedBoxes(){
+  if (!deletedMarkupIds.length) return;
+  const ids = deletedMarkupIds; deletedMarkupIds = [];
+  try { await API.markup.removeMarkups(ids); } catch(e){}
+}
+async function drawDeletedBoxes(){
+  await clearDeletedBoxes();
+  const red = { r: 218, g: 33, b: 44, a: 255 };
+  const items = diff.deleted.filter(x => x.a.bb).slice(0, MAX_DEL_BOXES);
+  const P = (x,y,z) => ({ positionX: x*1000, positionY: y*1000, positionZ: z*1000 });   // m -> mm
+  let lines = [];
+  for (const { a } of items){
+    const [x0,y0,z0,x1,y1,z1] = a.bb;
+    const c = [[x0,y0,z0],[x1,y0,z0],[x1,y1,z0],[x0,y1,z0],[x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1]];
+    for (const [i,j] of [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]])
+      lines.push({ start: P(...c[i]), end: P(...c[j]), color: red });
+  }
+  for (let i = 0; i < lines.length; i += 1200){
+    const res = await API.markup.addLineMarkups(lines.slice(i, i + 1200));
+    (res || []).forEach(m => { if (m && m.id != null) deletedMarkupIds.push(m.id); });
+  }
+  return items.length;
+}
+async function fitModel(){
+  try { await API.viewer.setCamera({ modelObjectIds:[{ modelId: current.modelId }] }, { animationTime: 500 }); } catch(e){}
+}
+
 async function paint(side){
   step = "coloration";
   const modelId = current.modelId;
@@ -480,6 +546,14 @@ async function paint(side){
       await API.viewer.setObjectState(s, iso ? { color: COLORS[k], visible: true } : { color: COLORS[k] });
     }
   }
+  // supprimés : contours rouges sur la version B
+  if (side === "B" && showDeleted && (!iso || activeCat === "deleted")){
+    if (iso && activeCat === "deleted") await API.viewer.setObjectState(sel(modelId), { visible: false });
+    await drawDeletedBoxes();
+  } else {
+    await clearDeletedBoxes();
+  }
+  $("toggleDel").textContent = showDeleted ? "Masquer les éléments supprimés de la vue" : "Afficher les éléments supprimés";
 }
 
 async function switchTo(side){
@@ -490,7 +564,7 @@ async function switchTo(side){
     loadedSide = side;
   }
   await paint(side);
-  status(side === "A" ? "Version A affichée : objets supprimés en rouge." : "Version B affichée : ajoutés en vert, géométrie modifiée en orange, propriétés seules en bleu.");
+  status(side === "A" ? "Version A affichée : objets supprimés en rouge." : "Version B affichée : ajoutés en vert, géométrie modifiée en orange, propriétés seules en bleu, supprimés en contour rouge.");
 }
 
 /* ===================== Lancement ===================== */
@@ -498,24 +572,34 @@ async function run(){
   const modelId = $("model").value, vA = $("vA").value, vB = $("vB").value;
   if (vA === vB){ status("Choisis deux versions différentes.", true); return; }
   $("run").disabled = true; $("results").style.display = "none";
+  running = true;
   try{
+    await clearDeletedBoxes();
+    // n'afficher que la maquette comparée : les autres sont déchargées (rétablies par « Réinitialiser la vue »)
+    const others = [...loadedIds].filter(id => id !== modelId);
+    if (others.length){
+      step = "masquage des autres maquettes";
+      try { await API.viewer.toggleModel(others, false, false); } catch(e){ if (!isTimeout(e)) throw e; }
+      hiddenOthers = [...new Set([...hiddenOthers, ...others])];
+    }
     current = { modelId, vA, vB, name: $("model").selectedOptions[0].textContent,
                 labelA: $("vA").selectedOptions[0].textContent, labelB: $("vB").selectedOptions[0].textContent };
-    const step = (base, span) => (p,msg) => { progress(base + p*span); status(msg); };
+    const prog = (base, span) => (p,msg) => { progress(base + p*span); status(msg); };
 
     status("Chargement de la version A…"); progress(0.02);
     await loadVersion(modelId, vA); loadedSide = "A";
-    snapA = await snapshot(modelId, "Version A", step(0.05, 0.4));
+    snapA = await snapshot(modelId, "Version A", prog(0.05, 0.4));
 
     status("Chargement de la version B…");
     await loadVersion(modelId, vB); loadedSide = "B";
-    snapB = await snapshot(modelId, "Version B", step(0.5, 0.45));
+    snapB = await snapshot(modelId, "Version B", prog(0.5, 0.45));
 
     const nearM = (parseFloat(String($("near").value).replace(",", ".")) || 100) / 1000;
     diff = compare(snapA, snapB, { geoMatch: $("geomatch").checked, near: nearM });
     activeCat = null;
     renderResults();
     await paint("B");
+    await fitModel();
     progress(null);
     const warn = (snapA.noGuid + snapB.noGuid) ? `\n${snapA.noGuid + snapB.noGuid} objets sans GUID ont été ignorés.` : "";
     const ratio = Math.min(snapA.map.size, snapB.map.size) / Math.max(1, Math.max(snapA.map.size, snapB.map.size));
@@ -523,12 +607,15 @@ async function run(){
       ? "\n⚠ Aucun objet commun : les GUID ont probablement été régénérés à l'export (comparaison GUID non exploitable pour ces versions)."
       : (ratio < 0.2 ? "\n⚠ Écart de taille très important entre A et B : vérifie que les deux versions sont complètes." : "");
     const geoNote = diff.byGeo ? `\nGUID différents pour ${diff.byGeo} objets : appariés par géométrie (même classe, même emprise ou emprise voisine).` : "";
-    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn + geoNote + alert);
+    const delNote = diff.deleted.length > MAX_DEL_BOXES ? `\nSeuls les ${MAX_DEL_BOXES} premiers supprimés sont dessinés en contour rouge (tous sont dans la liste et le CSV).` : "";
+    const hidNote = hiddenOthers.length ? `\n${hiddenOthers.length} autre(s) maquette(s) masquée(s) pendant la comparaison (« Réinitialiser la vue » pour les réafficher).` : "";
+    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn + geoNote + delNote + hidNote + alert);
   }catch(e){
     progress(null);
     status("Erreur pendant « " + (step || "préparation") + " » : " + (e.message || e) + "\nAstuce : réessaie, ou teste d'abord une maquette plus légère.", true);
   }finally{
     $("run").disabled = false;
+    running = false;
   }
 }
 
@@ -602,8 +689,22 @@ function exportCsv(){
 /* ===================== Événements ===================== */
 $("refresh").onclick = () => refreshModels();
 $("model").onchange = () => loadVersions();
+$("search").oninput = onSearch;
+$("search").onkeydown = e => { if (e.key === "Enter"){ const o = [...$("model").options].find(o => o.value); if (o && !$("model").value){ $("model").value = o.value; loadVersions(); } } };
+$("toggleDel").onclick = async () => {
+  showDeleted = !showDeleted;
+  try { if (loadedSide !== "B") await switchTo("B"); else await paint("B"); } catch(e){ fail(e); }
+};
 $("run").onclick = run;
-$("reset").onclick = async () => { await API.viewer.setObjectState(undefined, { color:"reset", visible:"reset" }); status("Vue réinitialisée."); };
+$("reset").onclick = async () => {
+  try{
+    await clearDeletedBoxes();
+    await API.viewer.setObjectState(undefined, { color:"reset", visible:"reset" });
+    const n = hiddenOthers.length;
+    if (n){ try { await API.viewer.toggleModel(hiddenOthers, true, false); } catch(e){ if (!isTimeout(e)) throw e; } hiddenOthers = []; }
+    status("Vue réinitialisée." + (n ? ` ${n} maquette(s) réaffichée(s).` : ""));
+  }catch(e){ fail(e); }
+};
 const fail = e => status("Erreur pendant « " + (step || "affichage") + " » : " + (e.message || e), true);
 $("showA").onclick = () => switchTo("A").catch(fail);
 $("showB").onclick = () => switchTo("B").catch(fail);
@@ -614,8 +715,8 @@ $("list").onclick = e => { const it = e.target.closest(".item"); if (it) focusRo
 document.querySelectorAll(".stat").forEach(b => b.onclick = async () => {
   activeCat = activeCat === b.dataset.k ? null : b.dataset.k;
   renderResults();
-  const side = activeCat === "deleted" ? "A" : "B";
-  if (loadedSide !== side) await switchTo(side); else await paint(side);
+  if (activeCat === "deleted") showDeleted = true;
+  if (loadedSide !== "B") await switchTo("B"); else await paint("B");
 });
 
 init();
