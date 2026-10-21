@@ -51,7 +51,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v1.6</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v1.7</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -98,7 +98,6 @@
     <div class="muted" id="summary" style="margin-top:4px"></div>
     <label class="chk"><input type="checkbox" id="isolate"> N'afficher que la catégorie sélectionnée</label>
     <div class="btns">
-      <button id="toggleDel">Masquer les éléments supprimés de la vue</button>
       <button id="showA">Voir les supprimés (version A)</button>
       <button id="showB">Revenir à la version B</button>
       <button id="csv">Exporter CSV</button>
@@ -137,8 +136,7 @@ let API = null, token = null, project = null;
 let snapA = null, snapB = null, diff = null, current = null;
 let activeCat = null, loadedSide = null;
 let allModels = [], loadedIds = new Set(), running = false;
-let hiddenOthers = [], showDeleted = true, deletedMarkupIds = [];
-const MAX_DEL_BOXES = 2000;
+let hiddenOthers = [];
 const $ = id => document.getElementById(id);
 let step = "";
 const isTimeout = e => /timed out|timeout/i.test(String(e && (e.message || e)));
@@ -501,29 +499,6 @@ function propDiff(a, b, viaGeo){
 /* ===================== Coloration ===================== */
 const sel = (modelId, rids) => ({ modelObjectIds:[{ modelId, objectRuntimeIds: rids }] });
 
-async function clearDeletedBoxes(){
-  if (!deletedMarkupIds.length) return;
-  const ids = deletedMarkupIds; deletedMarkupIds = [];
-  try { await API.markup.removeMarkups(ids); } catch(e){}
-}
-async function drawDeletedBoxes(){
-  await clearDeletedBoxes();
-  const red = { r: 218, g: 33, b: 44, a: 255 };
-  const items = diff.deleted.filter(x => x.a.bb).slice(0, MAX_DEL_BOXES);
-  const P = (x,y,z) => ({ positionX: x*1000, positionY: y*1000, positionZ: z*1000 });   // m -> mm
-  let lines = [];
-  for (const { a } of items){
-    const [x0,y0,z0,x1,y1,z1] = a.bb;
-    const c = [[x0,y0,z0],[x1,y0,z0],[x1,y1,z0],[x0,y1,z0],[x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1]];
-    for (const [i,j] of [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]])
-      lines.push({ start: P(...c[i]), end: P(...c[j]), color: red });
-  }
-  for (let i = 0; i < lines.length; i += 1200){
-    const res = await API.markup.addLineMarkups(lines.slice(i, i + 1200));
-    (res || []).forEach(m => { if (m && m.id != null) deletedMarkupIds.push(m.id); });
-  }
-  return items.length;
-}
 async function fitModel(){
   try { await API.viewer.setCamera({ modelObjectIds:[{ modelId: current.modelId }] }, { animationTime: 500 }); } catch(e){}
 }
@@ -546,14 +521,6 @@ async function paint(side){
       await API.viewer.setObjectState(s, iso ? { color: COLORS[k], visible: true } : { color: COLORS[k] });
     }
   }
-  // supprimés : contours rouges sur la version B
-  if (side === "B" && showDeleted && (!iso || activeCat === "deleted")){
-    if (iso && activeCat === "deleted") await API.viewer.setObjectState(sel(modelId), { visible: false });
-    await drawDeletedBoxes();
-  } else {
-    await clearDeletedBoxes();
-  }
-  $("toggleDel").textContent = showDeleted ? "Masquer les éléments supprimés de la vue" : "Afficher les éléments supprimés";
 }
 
 async function switchTo(side){
@@ -564,7 +531,7 @@ async function switchTo(side){
     loadedSide = side;
   }
   await paint(side);
-  status(side === "A" ? "Version A affichée : objets supprimés en rouge." : "Version B affichée : ajoutés en vert, géométrie modifiée en orange, propriétés seules en bleu, supprimés en contour rouge.");
+  status(side === "A" ? "Version A affichée : objets supprimés en rouge." : "Version B affichée : ajoutés en vert, géométrie modifiée en orange, propriétés seules en bleu.");
 }
 
 /* ===================== Lancement ===================== */
@@ -574,7 +541,6 @@ async function run(){
   $("run").disabled = true; $("results").style.display = "none";
   running = true;
   try{
-    await clearDeletedBoxes();
     // n'afficher que la maquette comparée : les autres sont déchargées (rétablies par « Réinitialiser la vue »)
     const others = [...loadedIds].filter(id => id !== modelId);
     if (others.length){
@@ -607,9 +573,8 @@ async function run(){
       ? "\n⚠ Aucun objet commun : les GUID ont probablement été régénérés à l'export (comparaison GUID non exploitable pour ces versions)."
       : (ratio < 0.2 ? "\n⚠ Écart de taille très important entre A et B : vérifie que les deux versions sont complètes." : "");
     const geoNote = diff.byGeo ? `\nGUID différents pour ${diff.byGeo} objets : appariés par géométrie (même classe, même emprise ou emprise voisine).` : "";
-    const delNote = diff.deleted.length > MAX_DEL_BOXES ? `\nSeuls les ${MAX_DEL_BOXES} premiers supprimés sont dessinés en contour rouge (tous sont dans la liste et le CSV).` : "";
     const hidNote = hiddenOthers.length ? `\n${hiddenOthers.length} autre(s) maquette(s) masquée(s) pendant la comparaison (« Réinitialiser la vue » pour les réafficher).` : "";
-    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn + geoNote + delNote + hidNote + alert);
+    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn + geoNote + hidNote + alert);
   }catch(e){
     progress(null);
     status("Erreur pendant « " + (step || "préparation") + " » : " + (e.message || e) + "\nAstuce : réessaie, ou teste d'abord une maquette plus légère.", true);
@@ -691,14 +656,10 @@ $("refresh").onclick = () => refreshModels();
 $("model").onchange = () => loadVersions();
 $("search").oninput = onSearch;
 $("search").onkeydown = e => { if (e.key === "Enter"){ const o = [...$("model").options].find(o => o.value); if (o && !$("model").value){ $("model").value = o.value; loadVersions(); } } };
-$("toggleDel").onclick = async () => {
-  showDeleted = !showDeleted;
-  try { if (loadedSide !== "B") await switchTo("B"); else await paint("B"); } catch(e){ fail(e); }
-};
+
 $("run").onclick = run;
 $("reset").onclick = async () => {
   try{
-    await clearDeletedBoxes();
     await API.viewer.setObjectState(undefined, { color:"reset", visible:"reset" });
     const n = hiddenOthers.length;
     if (n){ try { await API.viewer.toggleModel(hiddenOthers, true, false); } catch(e){ if (!isTimeout(e)) throw e; } hiddenOthers = []; }
@@ -715,8 +676,8 @@ $("list").onclick = e => { const it = e.target.closest(".item"); if (it) focusRo
 document.querySelectorAll(".stat").forEach(b => b.onclick = async () => {
   activeCat = activeCat === b.dataset.k ? null : b.dataset.k;
   renderResults();
-  if (activeCat === "deleted") showDeleted = true;
-  if (loadedSide !== "B") await switchTo("B"); else await paint("B");
+  const side = activeCat === "deleted" ? "A" : "B";
+  try { if (loadedSide !== side) await switchTo(side); else await paint(side); if (side === "A") await fitModel(); } catch(e){ fail(e); }
 });
 
 init();
