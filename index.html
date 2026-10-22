@@ -42,6 +42,9 @@
   .item .c{color:var(--mute);font-size:11px}
   .diff{font-size:11px;margin:4px 0 2px 15px}
   .diff div{padding:1px 0}
+  .diff .t{font-weight:600;margin-top:4px}
+  .diff .i{font-style:italic;color:var(--ink)}
+  .sum{font-size:11px;color:var(--ink);margin-top:1px}
   .diff s{color:var(--del)} .diff ins{color:var(--add);text-decoration:none}
   .muted{color:var(--mute);font-size:12px}
   .chk{display:flex;gap:6px;align-items:center;font-size:12px;margin-top:8px;color:var(--ink)}
@@ -58,7 +61,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v1.9</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v2.2</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -84,6 +87,10 @@
       <label for="tol">Tolérance géométrique (mm)</label>
       <input type="text" id="tol" value="1">
       <label class="chk"><input type="checkbox" id="geomatch" checked> Si les GUID diffèrent, apparier les objets par géométrie</label>
+      <label for="cogTol">Déplacement min. du centre de gravité pour « géométrie modifiée » (mm)</label>
+      <input type="text" id="cogTol" value="2">
+      <label for="qtyTol">Écart min. de volume / surface (%)</label>
+      <input type="text" id="qtyTol" value="0.01">
       <label for="near">Distance max. pour un objet déplacé (mm)</label>
       <input type="text" id="near" value="100">
     </details>
@@ -132,6 +139,33 @@ const ID_PROP = /›\s*(guid|globalid|global id|ifc ?guid|ifcguid|tekla ?guid|un
 // propriétés de quantité : un changement = géométrie modifiée (capte les trous / réservations qui ne changent pas l'emprise)
 const QTY_PROP = /›\s*(net|gross)?\s*(volume|side ?area|area|surface|aire|surface nette|surface brute|volume net|volume brut|footprint ?area|cross ?section ?area|perimeter|périmètre)$/i;
 const OPENING = /opening|ouverture|réservation|reservation/i;
+const COG_PROP = /^calculatedgeometryvalues\s*›\s*centerofgravity([xyz])$/i;   // calculé par Trimble Connect
+const OBB_PROP = /^orientedboundingbox\s*›/i;                                    // axes instables d'un export à l'autre : ignorés
+const GEO_SET  = /^calculatedgeometryvalues\s*›/i;
+const isGeoKey = k => GEO_SET.test(k) || OBB_PROP.test(k) || QTY_PROP.test(k);
+const num = v => { if (typeof v === "number") return v; const t = String(v ?? "").trim().replace(",", "."); return /^[-+]?\d*\.?\d+(e[-+]?\d+)?$/i.test(t) ? parseFloat(t) : NaN; };
+// réglages de tolérance (lus dans Options au lancement)
+let TOL = { qtyRel: 1e-4, qtyAbs: 5e-5, cogMm: 2, numRel: 1e-6, geoMm: 1 };
+// égalité « métier » d'une propriété : tolère le bruit numérique des exports
+function valEq(k, va, vb){
+  if (OBB_PROP.test(k)) return true;
+  const a = num(va), b = num(vb);
+  if (!isNaN(a) && !isNaN(b)){
+    if (COG_PROP.test(k)) return true;                    // traité globalement (distance 3D) dans cogShift()
+    if (QTY_PROP.test(k) || GEO_SET.test(k)) return Math.abs(a - b) <= Math.max(TOL.qtyAbs, TOL.qtyRel * Math.max(Math.abs(a), Math.abs(b)));
+    return Math.abs(a - b) <= TOL.numRel * Math.max(1, Math.abs(a), Math.abs(b));
+  }
+  return String(va ?? "") === String(vb ?? "");
+}
+// déplacement du centre de gravité, en mm (unité détectée en comparant à l'emprise, qui est en m)
+function cogShift(a, b){
+  const g = o => ["x","y","z"].map(ax => { const k = Object.keys(o.flat).find(k => COG_PROP.test(k) && k.toLowerCase().endsWith(ax)); return k ? num(o.flat[k]) : NaN; });
+  const ga = g(a), gb = g(b);
+  if (ga.some(isNaN) || gb.some(isNaN)) return null;
+  let toMm = 1;
+  if (a.bb){ const cx = (a.bb[0] + a.bb[3]) / 2; if (cx && Math.abs(ga[0] / cx - 1) < 0.01) toMm = 1000; }   // valeurs en m
+  return Math.hypot(ga[0]-gb[0], ga[1]-gb[1], ga[2]-gb[2]) * toMm;
+}
 const COLORS = {
   added:  "#1E8A44",
   deleted:"#DA212C",
@@ -455,7 +489,7 @@ async function snapshot(modelId, label, onP){
         bb: (bb && bb.min && bb.max) ? [bb.min.x,bb.min.y,bb.min.z,bb.max.x,bb.max.y,bb.max.z] : null,
         ph: hashStr(keys.map(k=>k+"="+flat[k]).join("|")),
         phNoId: hashStr(keys.filter(k=>!ID_PROP.test(k)).map(k=>k+"="+flat[k]).join("|")),
-        qh: hashStr(keys.filter(k=>QTY_PROP.test(k)).map(k=>{ const v = parseFloat(String(flat[k]).replace(",", ".")); return k+"="+(isFinite(v) ? v.toPrecision(4) : flat[k]); }).join("|")),
+        hasQty: keys.some(k => QTY_PROP.test(k) || COG_PROP.test(k)),
         osig: "",
         flat
       });
@@ -487,17 +521,29 @@ async function snapshot(modelId, label, onP){
 function compare(A, B, opts = {}){
   const d = { added:[], deleted:[], geom:[], props:[], same:[], byGuid:0, byGeo:0 };
   const pushPair = (a, b, viaGeo) => {
-    const ph = viaGeo ? [a.phNoId, b.phNoId] : [a.ph, b.ph];
     const why = [];
     if (a.geo !== b.geo) why.push("emprise / position");
     if ((a.osig || "") !== (b.osig || "")){
       const na = a.nOps || 0, nb = b.nOps || 0;
       why.push(na === nb ? `réservation(s) déplacée(s) ou redimensionnée(s) (${nb})` : `réservations ${na} → ${nb}`);
     }
-    if (a.qh !== b.qh) why.push("quantités (volume / surface)");
-    const x = { a, b, viaGeo, why };
+    const keys = new Set([...Object.keys(a.flat), ...Object.keys(b.flat)]);
+    let vol = false, area = false, otherGeo = false, props = false;
+    for (const k of keys){
+      if (viaGeo && ID_PROP.test(k)) continue;
+      if (valEq(k, a.flat[k], b.flat[k])) continue;
+      if (isGeoKey(k)){ if (/volume/i.test(k)) vol = true; else if (/area|surface|aire/i.test(k)) area = true; else otherGeo = true; }
+      else props = true;
+    }
+    if (vol) why.push("volume");
+    if (area) why.push("surface");
+    const sh = cogShift(a, b);
+    if (sh != null && sh > TOL.cogMm) why.push(`centre de gravité déplacé de ${sh.toFixed(sh < 10 ? 1 : 0)} mm`);
+    if (otherGeo && !why.length) why.push("valeurs géométriques calculées");
+    const x = { a, b, viaGeo, why, cog: sh };
+    if (why.length || props) x.desc = describe(x);
     if (why.length) d.geom.push(x);
-    else if (ph[0] !== ph[1]) d.props.push(x);
+    else if (props) d.props.push(x);
     else d.same.push(x);
     viaGeo ? d.byGeo++ : d.byGuid++;
   };
@@ -557,9 +603,135 @@ function propDiff(a, b, viaGeo){
   for (const k of keys){
     if (viaGeo && ID_PROP.test(k)) continue;
     const va = a.flat[k], vb = b.flat[k];
-    if (String(va) !== String(vb)) out.push({ k, va, vb });
+    if (COG_PROP.test(k)){ const sh = cogShift(a, b); if (sh == null || sh <= TOL.cogMm) continue; out.push({ k, va, vb }); continue; }
+    if (!valEq(k, va, vb)) out.push({ k, va, vb });
   }
   return out;
+}
+
+/* ===================== Description lisible des changements ===================== */
+const nf = (v, d = 0) => Number(v).toLocaleString("fr-FR", { minimumFractionDigits: d, maximumFractionDigits: d });
+const sg = (v, d = 0) => (v > 0 ? "+" : v < 0 ? "−" : "±") + nf(Math.abs(v), d);
+const AX = ["X", "Y", "Z"];
+const dimLabel = ["longueur X", "largeur Y", "hauteur Z"];
+
+function pickQty(o, re){
+  const ks = Object.keys(o.flat).filter(k => re.test(k) && !isNaN(num(o.flat[k])));
+  const k = ks.find(k => GEO_SET.test(k)) || ks.find(k => /net/i.test(k)) || ks[0];
+  return k ? { k, v: num(o.flat[k]) } : null;
+}
+function cogVec(o){
+  const v = ["x","y","z"].map(ax => { const k = Object.keys(o.flat).find(k => COG_PROP.test(k) && k.toLowerCase().endsWith(ax)); return k ? num(o.flat[k]) : NaN; });
+  if (v.some(isNaN)) return null;
+  if (o.bb){ const cx = (o.bb[0] + o.bb[3]) / 2; if (cx && Math.abs(v[0] / cx - 1) < 0.01) return v.map(x => x * 1000); }   // m -> mm
+  return v;
+}
+function fmtVal(v){
+  const n = num(v);
+  if (!isNaN(n)) return Math.abs(n) >= 1000 || Number.isInteger(n) ? nf(n, Number.isInteger(n) ? 0 : 1) : nf(n, 3);
+  return v == null || v === "" ? "(vide)" : "« " + v + " »";
+}
+
+function describe(x){
+  const { a, b } = x;
+  const geo = [], props = [];
+  const tol = TOL.geoMm;
+  let moved = 0, resized = false, inner = false, qtyChg = false;
+
+  // emprise : dimensions et position
+  if (a.bb && b.bb){
+    const dA = [0,1,2].map(i => (a.bb[i+3] - a.bb[i]) * 1000), dB = [0,1,2].map(i => (b.bb[i+3] - b.bb[i]) * 1000);
+    const cA = [0,1,2].map(i => (a.bb[i] + a.bb[i+3]) * 500), cB = [0,1,2].map(i => (b.bb[i] + b.bb[i+3]) * 500);
+    for (let i = 0; i < 3; i++){
+      const dd = dB[i] - dA[i];
+      if (Math.abs(dd) > tol){ resized = true; geo.push(`Dimension ${dimLabel[i]} : ${nf(dA[i])} → ${nf(dB[i])} mm (${sg(dd)} mm)`); }
+    }
+    const sh = [0,1,2].map(i => cB[i] - cA[i]);
+    moved = Math.hypot(...sh);
+    if (moved > tol){
+      geo.push(`${resized ? "Centre de l'emprise déplacé" : "Déplacé"} de ${nf(moved)} mm (${AX.map((ax,i) => "Δ" + ax + " " + sg(sh[i])).join(" · ")} mm)`);
+    }
+    x._bbShift = sh;
+  }
+  // volume / surface
+  for (const [re, unit, lab] of [[/volume/i, "m³", "Volume"], [/area|surface|aire/i, "m²", "Surface"]]){
+    const qa = pickQty(a, re), qb = pickQty(b, re);
+    if (!qa || !qb) continue;
+    const dv = qb.v - qa.v;
+    if (Math.abs(dv) <= Math.max(TOL.qtyAbs, TOL.qtyRel * Math.max(Math.abs(qa.v), Math.abs(qb.v)))) continue;
+    qtyChg = true;
+    const pct = qa.v ? (dv / qa.v) * 100 : 0;
+    const extra = unit === "m³" && Math.abs(dv) < 1 ? ` soit ${sg(dv * 1000, 1)} L` : "";
+    geo.push(`${lab} : ${nf(qa.v, 3)} → ${nf(qb.v, 3)} ${unit} (${sg(dv, 3)} ${unit}${extra}, ${sg(pct, 2)} %)`);
+  }
+  // centre de gravité : toujours signalé s'il bouge ; on précise la part non expliquée par l'emprise
+  const ga = cogVec(a), gb = cogVec(b);
+  if (ga && gb){
+    const dec = v => (Math.abs(v) >= 0.05 && Math.abs(v) < 10) ? 1 : 0;
+    const g = [0,1,2].map(i => gb[i] - ga[i]);
+    const n = Math.hypot(...g);
+    if (n > TOL.cogMm){
+      geo.push(`Centre de gravité déplacé de ${nf(n, n < 10 ? 1 : 0)} mm (${AX.map((ax,i) => "Δ" + ax + " " + sg(g[i], dec(g[i]))).join(" · ")} mm)`);
+      const bs = x._bbShift || [0,0,0];
+      const own = [0,1,2].map(i => g[i] - bs[i]);
+      const no = Math.hypot(...own);
+      if (moved <= tol && !resized) inner = true;
+      else if (no > TOL.cogMm){
+        inner = true;
+        geo.push(`  dont ${nf(no, no < 10 ? 1 : 0)} mm non expliqués par le déplacement de l'emprise (${AX.map((ax,i) => "Δ" + ax + " " + sg(own[i], dec(own[i]))).join(" · ")} mm) : forme intérieure modifiée`);
+      }
+    }
+  }
+  if (!resized && moved <= tol && qtyChg) inner = true;
+  // réservations
+  const na = a.nOps || 0, nb = b.nOps || 0;
+  const opsChg = (a.osig || "") !== (b.osig || "");
+  if (opsChg) geo.push(na === nb ? `Réservations : ${nb}, dont au moins une déplacée ou redimensionnée` : `Réservations : ${na} → ${nb} (${sg(nb - na)})`);
+
+  // propriétés non géométriques
+  for (const d of propDiff(a, b, x.viaGeo)){
+    if (isGeoKey(d.k) || COG_PROP.test(d.k)) continue;
+    const va = num(d.va), vb = num(d.vb);
+    const delta = (!isNaN(va) && !isNaN(vb)) ? ` (${sg(vb - va, Number.isInteger(vb - va) ? 0 : 3)})` : "";
+    props.push(`${d.k} : ${fmtVal(d.va)} → ${fmtVal(d.vb)}${delta}`);
+  }
+
+  // interprétation
+  const it = [];
+  if (opsChg) it.push(nb > na ? "réservation(s) ajoutée(s)" : nb < na ? "réservation(s) supprimée(s)" : "réservation(s) modifiée(s)");
+  if (resized) it.push("objet redimensionné");
+  else if (moved > tol) it.push(qtyChg || inner ? "objet déplacé et modifié" : "objet déplacé, forme inchangée");
+  if (inner && !opsChg) it.push(resized || moved > tol ? "forme intérieure également modifiée (trou, réservation ou découpe probable)" : "forme intérieure modifiée, contour extérieur inchangé (trou, réservation ou découpe probable)");
+  if (!geo.length && props.length) it.push(`${props.length} propriété(s) modifiée(s), géométrie inchangée`);
+  const interp = it.length ? it[0].charAt(0).toUpperCase() + it.join(" ; ").slice(1) : "";
+
+  // résumé court pour la liste
+  const short = [];
+  const vq = geo.find(l => l.startsWith("Volume"));
+  if (opsChg) short.push(na === nb ? "réservation modifiée" : `réservations ${sg(nb - na)}`);
+  if (resized) short.push("redimensionné");
+  if (moved > tol && !resized) short.push(`déplacé ${nf(moved)} mm`);
+  if (vq){ const L = vq.match(/soit ([^ ]+) L/), m = vq.match(/\(([^ ]+) m³/); if (L) short.push(`volume ${L[1]} L`); else if (m) short.push(`volume ${m[1]} m³`); }
+  if (inner && !vq && !opsChg) short.push("forme intérieure modifiée");
+  if (props.length) short.push(props.length === 1 ? props[0].split(" : ")[0].split(" › ").pop() + " modifié(e)" : `${props.length} propriétés modifiées`);
+  return { geo, props, interp, short: short.join(" · ") };
+}
+
+function describeSingle(o, k, snap){
+  const geo = [];
+  if (o.bb){
+    const d = [0,1,2].map(i => (o.bb[i+3] - o.bb[i]) * 1000);
+    geo.push(`Emprise : ${nf(d[0])} × ${nf(d[1])} × ${nf(d[2])} mm (X × Y × Z)`);
+  }
+  const v = pickQty(o, /volume/i);
+  if (v && v.v) geo.push(`Volume : ${nf(v.v, 3)} m³${v.v < 1 ? ` (${nf(v.v * 1000, 1)} L)` : ""}`);
+  let host = "";
+  if (o.hostRid){ const h = [...snap.map.values()].find(x => x.rid === o.hostRid); if (h) host = h.name; }
+  if (host) geo.push(`Réservation dans : ${host}`);
+  const what = k === "added" ? "Nouvel objet" : "Objet supprimé";
+  const short = [OPENING.test(o.cls) ? (k === "added" ? "réservation ajoutée" : "réservation supprimée") : (k === "added" ? "nouvel objet" : "supprimé"),
+                 v && v.v ? (v.v < 1 ? `${nf(v.v * 1000, 1)} L` : `${nf(v.v, 2)} m³`) : "", host ? `dans ${host}` : ""].filter(Boolean).join(" · ");
+  return { geo, props: [], interp: OPENING.test(o.cls) ? `${what} (réservation)` : what, short };
 }
 
 /* ===================== Coloration ===================== */
@@ -639,7 +811,11 @@ async function run(){
     snapB = await snapshot(modelId, "Version B", prog(0.5, 0.45));
 
     const nearM = (parseFloat(String($("near").value).replace(",", ".")) || 100) / 1000;
+    const pf = (id, d) => { const v = parseFloat(String($(id).value).replace(",", ".")); return isFinite(v) && v >= 0 ? v : d; };
+    TOL = { ...TOL, cogMm: pf("cogTol", 2), qtyRel: pf("qtyTol", 0.01) / 100, geoMm: pf("tol", 1) };
     diff = compare(snapA, snapB, { geoMatch: $("geomatch").checked, near: nearM });
+    diff.added.forEach(x => x.desc = describeSingle(x.b, "added", snapB));
+    diff.deleted.forEach(x => x.desc = describeSingle(x.a, "deleted", snapA));
     activeCat = null;
     renderResults();
     await paint("B");
@@ -657,7 +833,7 @@ async function run(){
     const hidNote = (hiddenOthers.length ? `\n${hiddenOthers.length} autre(s) maquette(s) masquée(s) (« Réinitialiser la vue » pour les réafficher).` : "")
       + (nRef ? `\n${nRef} maquette(s) de référence affichée(s) sans couleur.` : "");
     const opNote = (snapA.openings + snapB.openings) ? "\nRéservations (IfcOpeningElement) masquées par défaut dans Trimble Connect : œil ▾ de la barre d'outils → « IFC Opening Elements » pour les voir." : "";
-    const qty = [...snapB.map.values()].some(o => o.qh !== hashStr(""));
+    const qty = [...snapB.map.values()].some(o => o.hasQty);
     const qtyNote = qty ? "" : "\nAucune quantité (volume/surface) dans cette maquette : un trou modélisé sans ouverture IFC ne sera pas détecté. Demander l'export IFC avec les quantités de base.";
     status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn + geoNote + hidNote + opNote + qtyNote + alert);
   }catch(e){
@@ -695,7 +871,8 @@ function renderList(){
   const html = rows.slice(0, MAX).map((r,i) => `
     <div class="item" data-i="${i}">
       <div class="n"><i class="dot" style="background:${COLORS[r.k]}"></i>${esc(r.o.name)}</div>
-      <div class="c">${esc(r.o.cls)} · ${esc(r.o.guid)}${r.x.viaGeo ? " · apparié par géométrie" : ""}${r.k === "geom" && r.x.why ? " · " + esc(r.x.why.join(", ")) : ""}</div>
+      ${r.x.desc && r.x.desc.short ? `<div class="sum">${esc(r.x.desc.short)}</div>` : ""}
+      <div class="c">${esc(r.o.cls)} · ${esc(r.o.guid)}${r.x.viaGeo ? " · apparié par géométrie" : ""}</div>
     </div>`).join("");
   $("list").innerHTML = html + (rows.length > MAX ? `<div class="muted" style="padding:6px 2px">… ${rows.length - MAX} autres. Affine avec le filtre ou exporte le CSV.</div>` : "")
     + (rows.length ? "" : '<div class="muted" style="padding:6px 2px">Aucun élément.</div>');
@@ -715,11 +892,13 @@ async function focusRow(el){
   if (OPENING.test(o.cls)) status("Réservation sélectionnée avec son mur / sa dalle hôte. Si elle reste invisible : œil ▾ de la barre d'outils → « IFC Opening Elements ».");
   // détail des propriétés modifiées
   document.querySelectorAll(".diff").forEach(d=>d.remove());
-  if (r.x.a && r.x.b){
-    const pd = propDiff(r.x.a, r.x.b, r.x.viaGeo);
+  if (r.x.desc){
+    const D = r.x.desc;
     const box = document.createElement("div"); box.className = "diff";
-    box.innerHTML = (r.k === "geom" ? `<div><b>Géométrie modifiée : ${esc((r.x.why || []).join(", "))}</b></div>` : "")
-      + (pd.length ? pd.slice(0,30).map(d=>`<div>${esc(d.k)} : <s>${esc(d.va ?? "—")}</s> → <ins>${esc(d.vb ?? "—")}</ins></div>`).join("") : '<div class="muted">Aucune propriété modifiée.</div>');
+    box.innerHTML = (D.interp ? `<div class="i">${esc(D.interp)}</div>` : "")
+      + (D.geo.length ? `<div class="t">Géométrie</div>` + D.geo.map(l => `<div>• ${esc(l)}</div>`).join("") : "")
+      + (D.props.length ? `<div class="t">Propriétés (${D.props.length})</div>` + D.props.slice(0, 40).map(l => `<div>• ${esc(l)}</div>`).join("")
+          + (D.props.length > 40 ? `<div class="muted">… ${D.props.length - 40} autres dans le CSV</div>` : "") : "");
     el.appendChild(box);
   }
 }
@@ -727,13 +906,11 @@ async function focusRow(el){
 function exportCsv(){
   const label = { added:"Ajouté", deleted:"Supprimé", geom:"Géométrie modifiée", props:"Propriétés modifiées" };
   const q = v => `"${String(v ?? "").replace(/"/g,'""')}"`;
-  const lines = [["Statut","GUID","Nom","Classe","Appariement","Motif","Propriété","Valeur A","Valeur B"].map(q).join(";")];
+  const lines = [["Statut","GUID","Nom","Classe","Appariement","Interprétation","Changements géométriques","Propriétés modifiées"].map(q).join(";")];
   for (const r of rowsFor(null)){
-    const pd = (r.x.a && r.x.b) ? propDiff(r.x.a, r.x.b, r.x.viaGeo) : [];
     const how = (r.x.a && r.x.b) ? (r.x.viaGeo ? "Géométrie" : "GUID") : "";
-    const why = (r.x.why || []).join(", ");
-    if (!pd.length) lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, how, why, "", "", ""].map(q).join(";"));
-    else pd.forEach(d => lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, how, why, d.k, d.va, d.vb].map(q).join(";")));
+    const D = r.x.desc || { interp: "", geo: [], props: [] };
+    lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, how, D.interp, D.geo.join("\n"), D.props.join("\n")].map(q).join(";"));
   }
   const blob = new Blob(["﻿" + lines.join("\r\n")], { type:"text/csv;charset=utf-8" });
   const a = document.createElement("a");
