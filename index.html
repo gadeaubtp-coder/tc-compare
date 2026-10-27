@@ -38,6 +38,8 @@
   .list{max-height:340px;overflow:auto;border-top:1px solid var(--line);margin-top:8px}
   .item{padding:6px 2px;border-bottom:1px solid var(--line);cursor:pointer}
   .item:hover{background:#eef4fa}
+  .item.hl{background:#fff4d6;box-shadow:inset 3px 0 0 var(--blue)}
+  .pick{font-size:12px;margin-top:8px;padding:6px 8px;border-radius:3px;background:#eef4fa;display:none}
   .item .n{font-weight:600;display:flex;gap:6px;align-items:center}
   .item .c{color:var(--mute);font-size:11px}
   .diff{font-size:11px;margin:4px 0 2px 15px}
@@ -61,7 +63,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v2.3</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v2.5</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -123,6 +125,7 @@
       <button id="csv">Exporter CSV</button>
     </div>
     <input type="text" id="filter" placeholder="Filtrer par nom, classe, GUID…" style="margin-top:10px">
+    <div class="pick" id="pick"></div>
     <div class="list" id="list"></div>
   </div>
 </div>
@@ -154,7 +157,7 @@ function valEq(k, va, vb){
   if (OBB_PROP.test(k)) return true;
   const a = num(va), b = num(vb);
   if (!isNaN(a) && !isNaN(b)){
-    if (COG_PROP.test(k)) return true;                    // traité globalement (distance 3D) dans cogShift()
+    if (COG_PROP.test(k)) return true;                    // présent des deux côtés : traité globalement (distance 3D)
     if (QTY_PROP.test(k) || GEO_SET.test(k)) return Math.abs(a - b) <= Math.max(TOL.qtyAbs, TOL.qtyRel * Math.max(Math.abs(a), Math.abs(b)));
     return Math.abs(a - b) <= TOL.numRel * Math.max(1, Math.abs(a), Math.abs(b));
   }
@@ -190,6 +193,7 @@ let snapA = null, snapB = null, diff = null, current = null;
 let activeCat = null, loadedSide = null;
 let allModels = [], loadedIds = new Set(), running = false;
 let hiddenOthers = [];
+let selfSelect = false;   // vrai pendant une sélection déclenchée par la liste elle-même
 const refIds = new Set();   // maquettes de référence gardées affichées
 const $ = id => document.getElementById(id);
 let step = "";
@@ -223,6 +227,10 @@ async function init(){
   await refreshModels();
 }
 function onEvent(event, args){
+  if (event === "viewer.onSelectionChanged"){
+    if (current && diff && !running && !selfSelect) onViewerSelection(args && args.data !== undefined ? args.data : args);
+    return;
+  }
   if (event === "viewer.onModelStateChanged" && !running){
     clearTimeout(onEvent._t);
     onEvent._t = setTimeout(async () => {
@@ -493,7 +501,6 @@ async function snapshot(modelId, label, onP){
         ph: hashStr(keys.map(k=>k+"="+flat[k]).join("|")),
         phNoId: hashStr(keys.filter(k=>!ID_PROP.test(k)).map(k=>k+"="+flat[k]).join("|")),
         hasQty: keys.some(k => QTY_PROP.test(k) || COG_PROP.test(k)),
-        osig: "",
         flat
       });
     });
@@ -511,43 +518,28 @@ async function snapshot(modelId, label, onP){
       try { hosts = await API.viewer.getHierarchyParents(modelId, [op.rid], 8, false) || []; } catch(e){ if (isTimeout(e)) throw e; }
       for (const h of hosts){
         const host = byRid.get(h.id);
-        if (host){ (host._ops = host._ops || []).push(op.geo || op.guid); op.hostRid = host.rid; nOpen++; }
+        if (host){ (host._ops = host._ops || []).push(op.bb || null); op.hostRid = host.rid; nOpen++; }
       }
     }));
     onP && onP(1, `${label} : réservations ${Math.min(i + 6, openings.length)} / ${openings.length}`);
   }
-  for (const o of map.values()) if (o._ops){ o.osig = hashStr(o._ops.sort().join("|")); o.nOps = o._ops.length; delete o._ops; }
+  for (const o of map.values()) if (o._ops){ o.ops = o._ops; o.nOps = o._ops.length; delete o._ops; }
   return { map, total: ids.length, noGuid, spatial, openings: openings.length, hosted: nOpen };
 }
 
 /* ===================== Comparaison ===================== */
 function compare(A, B, opts = {}){
   const d = { added:[], deleted:[], geom:[], props:[], same:[], byGuid:0, byGeo:0, reclass:0, reclassBy:{} };
+  // RÈGLE UNIQUE : la couleur découle de la fiche.
+  //   orange = au moins un écart géométrique MESURÉ (emprise, volume/surface calculés, centre de gravité, réservations)
+  //   bleu   = aucun écart géométrique, au moins une métadonnée modifiée (classe IFC, propriétés, quantités d'exporteur…)
+  //   gris   = rien
   const pushPair = (a, b, viaGeo) => {
-    const why = [];
-    if (a.geo !== b.geo) why.push("emprise / position");
-    if ((a.osig || "") !== (b.osig || "")){
-      const na = a.nOps || 0, nb = b.nOps || 0;
-      why.push(na === nb ? `réservation(s) déplacée(s) ou redimensionnée(s) (${nb})` : `réservations ${na} → ${nb}`);
-    }
-    const keys = new Set([...Object.keys(a.flat), ...Object.keys(b.flat)]);
-    let vol = false, area = false, otherGeo = false, props = false;
-    if (clsKey(a.cls) !== clsKey(b.cls)){ props = true; d.reclass++; const k = clsName(a.cls) + " → " + clsName(b.cls); d.reclassBy[k] = (d.reclassBy[k] || 0) + 1; }
-    for (const k of keys){
-      if (viaGeo && ID_PROP.test(k)) continue;
-      if (valEq(k, a.flat[k], b.flat[k])) continue;
-      if (isGeoKey(k)){ if (/volume/i.test(k)) vol = true; else if (/area|surface|aire/i.test(k)) area = true; else otherGeo = true; }
-      else props = true;
-    }
-    if (vol) why.push("volume");
-    if (area) why.push("surface");
-    const sh = cogShift(a, b);
-    if (sh != null && sh > TOL.cogMm) why.push(`centre de gravité déplacé de ${sh.toFixed(sh < 10 ? 1 : 0)} mm`);
-    if (otherGeo && !why.length) why.push("valeurs géométriques calculées");
-    const x = { a, b, viaGeo, why, cog: sh };
-    if (why.length || props) x.desc = describe(x);
-    if (why.length) d.geom.push(x);
-    else if (props) d.props.push(x);
+    const x = { a, b, viaGeo };
+    if (clsKey(a.cls) !== clsKey(b.cls)){ d.reclass++; const k = clsName(a.cls) + " → " + clsName(b.cls); d.reclassBy[k] = (d.reclassBy[k] || 0) + 1; }
+    x.desc = describe(x);
+    if (x.desc.geo.length) d.geom.push(x);
+    else if (x.desc.props.length) d.props.push(x);
     else d.same.push(x);
     viaGeo ? d.byGeo++ : d.byGuid++;
   };
@@ -618,7 +610,7 @@ function propDiff(a, b, viaGeo){
   for (const k of keys){
     if (viaGeo && ID_PROP.test(k)) continue;
     const va = a.flat[k], vb = b.flat[k];
-    if (COG_PROP.test(k)){ const sh = cogShift(a, b); if (sh == null || sh <= TOL.cogMm) continue; out.push({ k, va, vb }); continue; }
+    if (COG_PROP.test(k) && k in a.flat && k in b.flat){ const sh = cogShift(a, b); if (sh == null || sh <= TOL.cogMm) continue; out.push({ k, va, vb }); continue; }
     if (!valEq(k, va, vb)) out.push({ k, va, vb });
   }
   return out;
@@ -647,6 +639,18 @@ function fmtVal(v){
   return v == null || v === "" ? "(vide)" : "« " + v + " »";
 }
 
+// deux listes d'emprises de réservations identiques à la tolérance près (appariement glouton)
+function sameBoxes(LA, LB, tolMm){
+  if (LA.length !== LB.length) return false;
+  const t = tolMm / 1000, used = new Set();
+  for (const p of LA){
+    const i = LB.findIndex((q, j) => !used.has(j) && ((!p && !q) || (p && q && p.every((v, n) => Math.abs(v - q[n]) <= t))));
+    if (i < 0) return false;
+    used.add(i);
+  }
+  return true;
+}
+
 function describe(x){
   const { a, b } = x;
   const geo = [], props = [];
@@ -668,10 +672,17 @@ function describe(x){
     }
     x._bbShift = sh;
   }
-  // volume / surface
+  // volume / surface : seulement des valeurs présentes et numériques dans LES DEUX versions.
+  // Si Trimble Connect a calculé la valeur (CalculatedGeometryValues), c'est elle qui fait foi ;
+  // les quantités de l'exporteur (Qto, Revit…) sont alors traitées comme des métadonnées.
+  const used = new Set();
   for (const [re, unit, lab] of [[/volume/i, "m³", "Volume"], [/area|surface|aire/i, "m²", "Surface"]]){
-    const qa = pickQty(a, re), qb = pickQty(b, re);
-    if (!qa || !qb) continue;
+    const common = Object.keys(a.flat).filter(k => re.test(k) && (QTY_PROP.test(k) || GEO_SET.test(k)) && k in b.flat && !isNaN(num(a.flat[k])) && !isNaN(num(b.flat[k])));
+    const calc = common.filter(k => GEO_SET.test(k));
+    const k = calc[0] || common.find(k => /net/i.test(k)) || common[0];
+    if (!k) continue;
+    used.add(k);
+    const qa = { v: num(a.flat[k]) }, qb = { v: num(b.flat[k]) };
     const dv = qb.v - qa.v;
     if (Math.abs(dv) <= Math.max(TOL.qtyAbs, TOL.qtyRel * Math.max(Math.abs(qa.v), Math.abs(qb.v)))) continue;
     qtyChg = true;
@@ -682,6 +693,7 @@ function describe(x){
   // centre de gravité : toujours signalé s'il bouge ; on précise la part non expliquée par l'emprise
   const ga = cogVec(a), gb = cogVec(b);
   if (ga && gb){
+    Object.keys(a.flat).filter(k => COG_PROP.test(k)).forEach(k => used.add(k));
     const dec = v => (Math.abs(v) >= 0.05 && Math.abs(v) < 10) ? 1 : 0;
     const g = [0,1,2].map(i => gb[i] - ga[i]);
     const n = Math.hypot(...g);
@@ -700,7 +712,7 @@ function describe(x){
   if (!resized && moved <= tol && qtyChg) inner = true;
   // réservations
   const na = a.nOps || 0, nb = b.nOps || 0;
-  const opsChg = (a.osig || "") !== (b.osig || "");
+  const opsChg = !sameBoxes(a.ops || [], b.ops || [], tol);
   if (opsChg) geo.push(na === nb ? `Réservations : ${nb}, dont au moins une déplacée ou redimensionnée` : `Réservations : ${na} → ${nb} (${sg(nb - na)})`);
 
   // classe IFC
@@ -708,7 +720,7 @@ function describe(x){
   if (reclass) props.push(`Classe IFC : ${clsName(a.cls)} → ${clsName(b.cls)}`);
   // propriétés non géométriques
   for (const d of propDiff(a, b, x.viaGeo)){
-    if (isGeoKey(d.k) || COG_PROP.test(d.k)) continue;
+    if (used.has(d.k) || OBB_PROP.test(d.k)) continue;   // déjà mesuré en géométrie, ou boîte orientée (instable)
     const va = num(d.va), vb = num(d.vb);
     const delta = (!isNaN(va) && !isNaN(vb)) ? ` (${sg(vb - va, Number.isInteger(vb - va) ? 0 : 3)})` : "";
     props.push(`${d.k} : ${fmtVal(d.va)} → ${fmtVal(d.vb)}${delta}`);
@@ -839,6 +851,17 @@ async function run(){
     TOL = { ...TOL, cogMm: pf("cogTol", 2), qtyRel: pf("qtyTol", 0.01) / 100, geoMm: pf("tol", 1) };
     diff = compare(snapA, snapB, { geoMatch: $("geomatch").checked, near: nearM });
     diff.added.forEach(x => x.desc = describeSingle(x.b, "added", snapB));
+    // index « objet cliqué dans la vue » -> ligne de la liste
+    diff.idxA = new Map(); diff.idxB = new Map();
+    for (const k of ["added","deleted","geom","props","same"]) for (const x of diff[k]){
+      if (x.a) diff.idxA.set(x.a.rid, { k, x });
+      if (x.b) diff.idxB.set(x.b.rid, { k, x });
+    }
+    // contrôle de cohérence couleur / fiche (ne doit jamais se déclencher)
+    const incoh = [...diff.geom.filter(x => !x.desc.geo.length),
+                   ...diff.props.filter(x => x.desc.geo.length || !x.desc.props.length),
+                   ...diff.same.filter(x => x.desc.geo.length || x.desc.props.length)];
+    diff.incoherent = incoh.length;
     diff.deleted.forEach(x => x.desc = describeSingle(x.a, "deleted", snapA));
     activeCat = null;
     renderResults();
@@ -861,7 +884,8 @@ async function run(){
     const opNote = (snapA.openings + snapB.openings) ? "\nRéservations (IfcOpeningElement) masquées par défaut dans Trimble Connect : œil ▾ de la barre d'outils → « IFC Opening Elements » pour les voir." : "";
     const qty = [...snapB.map.values()].some(o => o.hasQty);
     const qtyNote = qty ? "" : "\nAucune quantité (volume/surface) dans cette maquette : un trou modélisé sans ouverture IFC ne sera pas détecté. Demander l'export IFC avec les quantités de base.";
-    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + warn + reclNote + geoNote + hidNote + opNote + qtyNote + alert);
+    const chk = diff.incoherent ? `\n⛔ CONTRÔLE : ${diff.incoherent} élément(s) dont la couleur ne correspond pas à la fiche. Ne pas diffuser ce résultat, signaler le cas.` : "\n✔ Contrôle de cohérence : chaque couleur correspond à sa fiche.";
+    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + chk + warn + reclNote + geoNote + hidNote + opNote + qtyNote + alert);
   }catch(e){
     progress(null);
     status("Erreur pendant « " + (step || "préparation") + " » : " + (e.message || e) + "\nAstuce : réessaie, ou teste d'abord une maquette plus légère.", true);
@@ -913,10 +937,23 @@ async function focusRow(el){
   const o = side === "A" ? r.x.a : r.x.b;
   const rids = [o.rid].concat(o.hostRid ? [o.hostRid] : []);
   const s2 = sel(current.modelId, rids);
-  await API.viewer.setSelection(s2, "set");
-  await API.viewer.setCamera(s2, { animationTime: 400 });
+  $("pick").style.display = "none";
+  highlight(el);
+  selfSelect = true;
+  try {
+    await API.viewer.setSelection(s2, "set");
+    await API.viewer.setCamera(s2, { animationTime: 400 });
+  } finally { setTimeout(() => { selfSelect = false; }, 600); }
   if (OPENING.test(o.cls)) status("Réservation sélectionnée avec son mur / sa dalle hôte. Si elle reste invisible : œil ▾ de la barre d'outils → « IFC Opening Elements ».");
-  // détail des propriétés modifiées
+  showDetail(el, r);
+}
+
+function highlight(el){
+  document.querySelectorAll("#list .item.hl").forEach(e => e.classList.remove("hl"));
+  if (el){ el.classList.add("hl"); try { el.scrollIntoView({ block: "nearest", behavior: "smooth" }); } catch(e){ el.scrollIntoView(); } }
+}
+
+function showDetail(el, r){
   document.querySelectorAll(".diff").forEach(d=>d.remove());
   if (r.x.desc){
     const D = r.x.desc;
@@ -927,6 +964,51 @@ async function focusRow(el){
           + (D.props.length > 40 ? `<div class="muted">… ${D.props.length - 40} autres dans le CSV</div>` : "") : "");
     el.appendChild(box);
   }
+}
+
+// Clic dans la vue 3D : on retrouve l'élément et on le met en surbrillance dans la liste
+function onViewerSelection(selData){
+  const box = $("pick");
+  const arr = Array.isArray(selData) ? selData : (selData ? [selData] : []);
+  const idx = loadedSide === "A" ? diff.idxA : diff.idxB;
+  const rids = arr.filter(m => m && m.modelId === current.modelId).flatMap(m => m.objectRuntimeIds || []);
+  if (!rids.length){
+    highlight(null); document.querySelectorAll(".diff").forEach(d=>d.remove());
+    const other = arr.some(m => m && m.modelId && m.modelId !== current.modelId && (m.objectRuntimeIds || []).length);
+    box.style.display = other ? "block" : "none";
+    box.textContent = other ? "Objet sélectionné dans une maquette de référence : il ne fait pas partie de la comparaison." : "";
+    return;
+  }
+  // priorité à un élément modifié s'il y en a plusieurs (ex. réservation + mur hôte)
+  const order = { geom: 0, props: 1, added: 2, deleted: 3, same: 4 };
+  const hits = rids.map(r => idx.get(r)).filter(Boolean).sort((p, q) => order[p.k] - order[q.k]);
+  if (!hits.length){
+    highlight(null); box.style.display = "block";
+    box.textContent = "Objet sélectionné non comparé (conteneur, objet sans GUID ou hors de la maquette comparée).";
+    return;
+  }
+  const hit = hits[0];
+  const o = loadedSide === "A" ? hit.x.a : hit.x.b;
+  if (hit.k === "same"){
+    highlight(null); document.querySelectorAll(".diff").forEach(d=>d.remove());
+    box.style.display = "block";
+    box.textContent = `${o.name} : inchangé (gris) entre la version A et la version B.`;
+    return;
+  }
+  box.style.display = "none";
+  let rows = $("list")._rows || [];
+  let i = rows.findIndex(r => r.x === hit.x);
+  if (i < 0 || i >= 400){
+    // l'élément est masqué par la catégorie active, le filtre ou la limite d'affichage : on filtre sur lui
+    activeCat = null; $("filter").value = o.guid; renderResults();
+    rows = $("list")._rows || []; i = rows.findIndex(r => r.x === hit.x);
+    box.style.display = "block"; box.textContent = "Liste filtrée sur l'objet sélectionné dans la vue (efface le filtre pour tout revoir).";
+  }
+  const el = $("list").querySelector(`.item[data-i="${i}"]`);
+  if (!el) return;
+  highlight(el);
+  showDetail(el, rows[i]);
+  if (rids.length > 1 && hits.length > 1) box.style.display = "block", box.textContent = `${rids.length} objets sélectionnés : affichage du plus significatif.`;
 }
 
 function exportCsv(){
