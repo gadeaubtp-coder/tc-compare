@@ -1,4 +1,4 @@
-# Comparateur de versions — extension Trimble Connect (vue 3D) · v2.8
+# Comparateur de versions — extension Trimble Connect (vue 3D) · v3.0
 
 Hébergée sur https://gadeaubtp-coder.github.io/tc-compare/ — manifest : https://gadeaubtp-coder.github.io/tc-compare/manifest.json
 
@@ -41,6 +41,11 @@ Compare deux versions d'une même maquette directement dans la vue 3D de Trimble
   1. **emprise / position** (boîte englobante, tolérance 1 mm) ;
   2. **réservations** : chaque IfcOpeningElement est rattaché à son hôte (relation IfcRelVoidsElement) ; un mur dont les ouvertures changent (ajout, suppression, déplacement) passe en orange ;
   3. **géométrie calculée** : volume et surface (CalculatedGeometryValues de Trimble Connect, quantités IFC, propriétés Revit) et **centre de gravité** ; capte un trou modélisé directement dans le mur, sans objet ouverture.
+- **Principe directeur (v3.0) : une donnée absente, illisible ou incohérente ne peut JAMAIS produire un orange.** Elle est signalée comme « non comparable » dans la fiche et le CSV, et l'objet n'est pas déclaré modifié. Cela couvre : emprise non fournie par Trimble, centre de gravité sans emprise de contrôle, unité de centre de gravité indéterminable ou discordante entre les deux versions, emprise de réservation illisible d'un seul côté, quantité présente dans une seule version, quantité non numérique, changement d'unité à l'export (rapport voisin de 10³/10⁶/10⁹).
+- **Preuve exigée pour chaque orange.** Un orange porte toujours, dans sa fiche et dans le CSV, la preuve sur laquelle il repose : « écart net au-delà des seuils de bruit », « quantité écrite dans l'IFC modifiée » ou « écart confirmé par une quantité de l'IFC ».
+- **Filet de sécurité à l'exécution.** Avant affichage, chaque orange est contrôlé : au moins une ligne géométrique, au moins une valeur chiffrée, aucune valeur non numérique (∞, NaN), une preuve enregistrée. Tout élément qui échoue est **automatiquement rétrogradé en jaune « à vérifier »** et signalé dans le bandeau de résultat. L'outil ne peut donc pas afficher un orange non étayé.
+- **Appariement par proximité** (cas des GUID régénérés) : l'appariement est une hypothèse, pas une certitude. Un déplacement mesuré sur un objet apparié ainsi ne peut pas produire un orange à lui seul ; il faut une confirmation par une quantité de l'IFC, sinon l'objet est jaune.
+- **Rotation distinguée du redimensionnement** : une emprise modifiée à volume constant est annoncée comme « objet pivoté ou réorienté », et non comme un redimensionnement ; l'écart résiduel du centre de gravité n'est alors pas interprété comme une découpe intérieure.
 - Comparaison **avec tolérances** (v2.0) : volume/surface ±0,01 %, centre de gravité 2 mm, autres valeurs numériques ±1e-6 relatif ; réglables dans Options. Le bruit numérique d'un réexport (µm, cm³) n'est plus compté. Les axes « OrientedBoundingBox » sont ignorés : Trimble peut réorienter la boîte d'un export à l'autre sans que l'objet change.
 - Un trou modélisé **sans ouverture IFC** dans une maquette exportée **sans quantités** reste indétectable : l'API de Trimble Connect ne donne pas accès au maillage. Demander l'export IFC avec les quantités de base (Revit : « Exporter les quantités de base »).
 - Les réservations (IfcOpeningElement) sont **masquées par défaut** dans Trimble Connect : œil ▾ de la barre d'outils → « IFC Opening Elements ». Cliquer une réservation dans la liste sélectionne aussi son hôte.

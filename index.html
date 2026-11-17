@@ -63,7 +63,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v2.8</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.0</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -588,8 +588,8 @@ function compare(A, B, opts = {}){
   //   orange = au moins un écart géométrique MESURÉ (emprise, volume/surface calculés, centre de gravité, réservations)
   //   bleu   = aucun écart géométrique, au moins une métadonnée modifiée (classe IFC, propriétés, quantités d'exporteur…)
   //   gris   = rien
-  const pushPair = (a, b, viaGeo) => {
-    const x = { a, b, viaGeo };
+  const pushPair = (a, b, viaGeo, viaNear) => {
+    const x = { a, b, viaGeo, viaNear };
     if (clsKey(a.cls) !== clsKey(b.cls)){ d.reclass++; const k = clsName(a.cls) + " → " + clsName(b.cls); d.reclassBy[k] = (d.reclassBy[k] || 0) + 1; }
     x.desc = describe(x);
     if (x.desc.level === "geom") d.geom.push(x);
@@ -651,7 +651,7 @@ function compare(A, B, opts = {}){
           if (dist <= near && sizeOk && dist < bestD){ best = a; bestD = dist; }
         }
       }
-      if (best){ used2.add(best); pushPair(best, b, true); } else left2.push(b);
+      if (best){ used2.add(best); pushPair(best, b, true, true); } else left2.push(b);
     }
     restA = restA.filter(a => !used2.has(a)); restB = left2;
   }
@@ -672,7 +672,7 @@ function propDiff(a, b, viaGeo){
 }
 
 /* ===================== Description lisible des changements ===================== */
-const nf = (v, d = 0) => Number(v).toLocaleString("fr-FR", { minimumFractionDigits: d, maximumFractionDigits: d });
+const nf = (v, d = 0) => isFinite(Number(v)) ? Number(v).toLocaleString("fr-FR", { minimumFractionDigits: d, maximumFractionDigits: d }) : "?";
 const sg = (v, d = 0) => (v > 0 ? "+" : v < 0 ? "−" : "±") + nf(Math.abs(v), d);
 const AX = ["X", "Y", "Z"];
 const dimLabel = ["longueur X", "largeur Y", "hauteur Z"];
@@ -682,11 +682,20 @@ function pickQty(o, re){
   const k = ks.find(k => GEO_SET.test(k)) || ks.find(k => /net/i.test(k)) || ks[0];
   return k ? { k, v: num(o.flat[k]) } : null;
 }
+// Centre de gravité ramené en mm, avec contrôle d'unité : le CdG doit tomber près de l'emprise.
+// Retourne { v: [x,y,z] en mm, unit: "m" | "mm" } ou null si l'unité n'est pas déterminable.
 function cogVec(o){
   const v = ["x","y","z"].map(ax => { const k = Object.keys(o.flat).find(k => COG_PROP.test(k) && k.toLowerCase().endsWith(ax)); return k ? num(o.flat[k]) : NaN; });
-  if (v.some(isNaN)) return null;
-  if (o.bb){ const cx = (o.bb[0] + o.bb[3]) / 2; if (cx && Math.abs(v[0] / cx - 1) < 0.01) return v.map(x => x * 1000); }   // m -> mm
-  return v;
+  if (v.some(v => !isFinite(v))) return null;
+  if (!o.bb) return null;                                   // sans emprise, aucun contrôle d'unité possible
+  const c = [0,1,2].map(i => (o.bb[i] + o.bb[i+3]) / 2);    // centre de l'emprise, en m
+  const diag = Math.hypot(o.bb[3]-o.bb[0], o.bb[4]-o.bb[1], o.bb[5]-o.bb[2]);
+  const limit = Math.max(2 * diag, 0.05);                   // le CdG reste près de l'objet (formes en L comprises)
+  const dM  = Math.hypot(...v.map((x,i) => x - c[i]));               // hypothèse : valeurs en m
+  const dMm = Math.hypot(...v.map((x,i) => x / 1000 - c[i]));        // hypothèse : valeurs en mm
+  if (dM <= limit && dM <= dMm)  return { v: v.map(x => x * 1000), unit: "m" };
+  if (dMm <= limit)              return { v: v.slice(),            unit: "mm" };
+  return null;                                              // incohérent avec l'emprise : non exploitable
 }
 function fmtVal(v){
   const n = num(v);
@@ -706,31 +715,40 @@ function sameBoxes(LA, LB, tolMm){
   return true;
 }
 
-// écart max (mm) entre les réservations de A et B, appariées au plus proche
+// Écart max (mm) entre les réservations de A et B, appariées au plus proche.
+// Règle stricte : si une seule emprise de réservation manque d'un côté, l'appariement n'est pas
+// fiable (on risquerait de comparer deux réservations différentes) -> aucun verdict géométrique.
 function opsDev(LA, LB){
-  if (LA.length !== LB.length) return { count: true, dev: Infinity };
+  if (LA.length !== LB.length) return { count: true, dev: 0, measurable: true };
+  if (LA.some(p => !p) || LB.some(p => !p)) return { count: false, dev: 0, measurable: false };
   const used = new Set(); let dev = 0;
   for (const p of LA){
     let best = -1, bd = Infinity;
     LB.forEach((q, j) => {
       if (used.has(j)) return;
-      const d = (!p || !q) ? (p === q ? 0 : Infinity) : Math.max(...p.map((v, n) => Math.abs(v - q[n]) * 1000));
+      const d = Math.max(...p.map((v, n) => Math.abs(v - q[n]) * 1000));
       if (d < bd){ bd = d; best = j; }
     });
-    if (best >= 0) used.add(best);
-    dev = Math.max(dev, bd);
+    if (best < 0) return { count: false, dev: 0, measurable: false };
+    used.add(best); dev = Math.max(dev, bd);
   }
-  return { count: false, dev };
+  return { count: false, dev, measurable: true };
 }
 
 function describe(x){
   const { a, b } = x;
+  // objet apparié par simple proximité (GUID régénérés) : l'appariement lui-même est une hypothèse,
+  // le déplacement mesuré ne peut donc pas valoir preuve -> il faut une confirmation par l'IFC.
+  const guessed = !!x.viaNear;
   const geo = [], props = [];
   const tol = TOL.geoMm;
   let moved = 0, resized = false, inner = false, qtyChg = false;
   // gravité : « big » = au-delà du seuil orange sans confirmation ; « small » = au-dessus du bruit mais en dessous
   let big = false, smallQty = { vol: 0, area: 0 }, smallOther = false, direct = false;
-  const sevMm = v => { if (v > TOL.bigMm) big = true; else smallOther = true; };
+  const unmeasured = [];   // grandeurs qu'on n'a PAS pu comparer : jamais une raison de déclarer « modifié »
+  if (!a.bb || !b.bb) unmeasured.push("emprise");
+  const dimLines = [];
+  const sevMm = v => { if (v > TOL.bigMm && !guessed) big = true; else smallOther = true; };
 
   // emprise : dimensions et position
   if (a.bb && b.bb){
@@ -738,8 +756,9 @@ function describe(x){
     const cA = [0,1,2].map(i => (a.bb[i] + a.bb[i+3]) * 500), cB = [0,1,2].map(i => (b.bb[i] + b.bb[i+3]) * 500);
     for (let i = 0; i < 3; i++){
       const dd = dB[i] - dA[i];
-      if (Math.abs(dd) > tol){ resized = true; sevMm(Math.abs(dd)); geo.push(`Dimension ${dimLabel[i]} : ${nf(dA[i])} → ${nf(dB[i])} mm (${sg(dd)} mm)`); }
+      if (Math.abs(dd) > tol){ resized = true; sevMm(Math.abs(dd)); dimLines.push({ i, dA: dA[i], dB: dB[i], dd }); }
     }
+    for (const L of dimLines) geo.push(`Emprise ${dimLabel[L.i]} : ${nf(L.dA)} → ${nf(L.dB)} mm (${sg(L.dd)} mm)`);
     const sh = [0,1,2].map(i => cB[i] - cA[i]);
     moved = Math.hypot(...sh);
     if (moved > tol){
@@ -759,6 +778,14 @@ function describe(x){
     if (!k) continue;
     used.add(k);
     const qa = { v: num(a.flat[k]) }, qb = { v: num(b.flat[k]) };
+    // rapport voisin d'une puissance de 1000 => changement d'unité à l'export, pas de la géométrie
+    if (qa.v && qb.v){
+      const r = qb.v / qa.v;
+      if ([1e3, 1e-3, 1e6, 1e-6, 1e9, 1e-9].some(u => Math.abs(r / u - 1) < 0.001)){
+        unmeasured.push(`${lab} (changement d'unité à l'export : ×${nf(r, 0)})`);
+        continue;
+      }
+    }
     const dv = qb.v - qa.v;
     if (Math.abs(dv) <= Math.max(TOL.qtyAbs, TOL.qtyRel * Math.max(Math.abs(qa.v), Math.abs(qb.v)))) continue;
     qtyChg = true;
@@ -769,8 +796,20 @@ function describe(x){
     const dq = Math.abs(dv) >= 0.001 ? 3 : 4;   // 4 décimales si l'écart est inférieur au millième
     geo.push(`${lab} : ${nf(qa.v, dq)} → ${nf(qb.v, dq)} ${unit} (${sg(dv, dq)} ${unit}, ${sg(pct, 2)} %)`);
   }
+  // emprise modifiée mais volume conservé => rotation / réorientation, pas un redimensionnement
+  let rotated = false;
+  if (resized && !qtyChg){
+    const vA = pickQty(a, /volume/i), vB = pickQty(b, /volume/i);
+    if (vA && vB && vA.v && Math.abs(vB.v - vA.v) <= Math.max(TOL.qtyAbs, TOL.qtyRel * Math.max(vA.v, vB.v))){
+      rotated = true;
+      geo.push(`Volume conservé (${nf(vA.v, 3)} m³) malgré l'emprise modifiée : objet pivoté ou réorienté, et non redimensionné`);
+    }
+  }
   // centre de gravité : toujours signalé s'il bouge ; on précise la part non expliquée par l'emprise
-  const ga = cogVec(a), gb = cogVec(b);
+  const ca = cogVec(a), cb2 = cogVec(b);
+  const cogOk = ca && cb2 && ca.unit === cb2.unit;          // unités discordantes = donnée non comparable
+  if (!cogOk && (ca || cb2)) unmeasured.push("centre de gravité");
+  const ga = cogOk ? ca.v : null, gb = cogOk ? cb2.v : null;
   if (ga && gb){
     Object.keys(a.flat).filter(k => COG_PROP.test(k)).forEach(k => used.add(k));
     const dec = v => (Math.abs(v) >= 0.05 && Math.abs(v) < 10) ? 1 : 0;
@@ -783,7 +822,7 @@ function describe(x){
       const own = [0,1,2].map(i => g[i] - bs[i]);
       const no = Math.hypot(...own);
       if (moved <= tol && !resized) inner = true;
-      else if (no > TOL.cogMm){
+      else if (no > TOL.cogMm && !rotated){
         inner = true;
         geo.push(`  dont ${nf(no, no < 10 ? 1 : 0)} mm non expliqués par le déplacement de l'emprise (${AX.map((ax,i) => "Δ" + ax + " " + sg(own[i], dec(own[i]))).join(" · ")} mm) : forme intérieure modifiée`);
       }
@@ -793,7 +832,8 @@ function describe(x){
   // réservations
   const na = a.nOps || 0, nb = b.nOps || 0;
   const od = opsDev(a.ops || [], b.ops || []);
-  const opsChg = od.count || od.dev > tol;
+  if (!od.measurable) unmeasured.push(`réservations (${nb}, emprise non lisible)`);
+  const opsChg = od.count || (od.measurable && isFinite(od.dev) && od.dev > tol);
   if (od.count) big = true; else if (opsChg) sevMm(od.dev);
   if (opsChg) geo.push(na === nb ? `Réservations : ${nb}, dont au moins une déplacée ou redimensionnée (écart max ${nf(od.dev, od.dev < 10 ? 1 : 0)} mm)` : `Réservations : ${na} → ${nb} (${sg(nb - na)})`);
 
@@ -815,6 +855,9 @@ function describe(x){
     || (smallQty.area && ifcQ.area === smallQty.area)
     || (smallOther && anyIfc);
   const small = smallOther || !!smallQty.vol || !!smallQty.area;
+  const proof = big ? (direct ? "quantité écrite dans l'IFC modifiée"
+                     : "écart net, au-delà des seuils de bruit")
+             : (small && confirmed) ? "écart confirmé par une quantité de l'IFC" : "";
   const level = (big || (small && confirmed)) ? "geom" : small ? "verify" : null;
   if (level && confirmed && conf.length){
     conf.forEach(c => used.add(c.k));                         // affichée comme preuve, pas en doublon dans les métadonnées
@@ -837,7 +880,8 @@ function describe(x){
   const it = [];
   if (reclass) it.push(`reclassification IFC (${clsName(a.cls)} → ${clsName(b.cls)})`);
   if (opsChg) it.push(nb > na ? "réservation(s) ajoutée(s)" : nb < na ? "réservation(s) supprimée(s)" : "réservation(s) modifiée(s)");
-  if (resized) it.push("objet redimensionné");
+  if (rotated) it.push("objet pivoté ou réorienté (volume conservé) — l'emprise change, les dimensions propres de l'objet non");
+  else if (resized) it.push("objet redimensionné");
   else if (moved > tol) it.push(qtyChg || inner ? "objet déplacé et modifié" : "objet déplacé, forme inchangée");
   if (inner && !opsChg) it.push(resized || moved > tol ? "forme intérieure également modifiée (trou, réservation ou découpe probable)" : "forme intérieure modifiée, contour extérieur inchangé (trou, réservation ou découpe probable)");
   const nProps = props.length - (reclass ? 1 : 0);
@@ -850,7 +894,7 @@ function describe(x){
   const short = [];
   const vq = geo.find(l => l.startsWith("Volume"));
   if (opsChg) short.push(na === nb ? "réservation modifiée" : `réservations ${sg(nb - na)}`);
-  if (resized) short.push("redimensionné");
+  if (rotated) short.push("pivoté"); else if (resized) short.push("redimensionné");
   if (moved > tol && !resized) short.push(`déplacé ${nf(moved)} mm`);
   if (vq){ const m = vq.match(/\(([^ ]+) m³/); if (m) short.push(`volume ${m[1]} m³`); }
   if (inner && !vq && !opsChg) short.push("forme intérieure modifiée");
@@ -858,7 +902,7 @@ function describe(x){
   const np = props.length - (reclass ? 1 : 0);
   if (np) short.push(np === 1 ? props[reclass ? 1 : 0].split(" : ")[0].split(" › ").pop() + " modifié(e)" : `${np} propriétés modifiées`);
   if (false) short.push(props.length === 1 ? props[0].split(" : ")[0].split(" › ").pop() + " modifié(e)" : `${props.length} propriétés modifiées`);
-  return { geo, props, interp, short: (level === "verify" ? "à vérifier · " : "") + short.join(" · "), level };
+  return { geo, props, interp, short: (level === "verify" ? "à vérifier · " : "") + short.join(" · "), level, proof, unmeasured };
 }
 
 function describeSingle(o, k, snap){
@@ -959,6 +1003,33 @@ async function run(){
     TOL = { ...TOL, cogMm: pf("cogTol", 2), qtyRel: pf("qtyTol", 0.01) / 100, geoMm: pf("tol", 1), bigMm: pf("bigMm", 20), bigPct: pf("bigPct", 5) };
     diff = compare(snapA, snapB, { geoMatch: $("geomatch").checked, near: nearM });
     diff.added.forEach(x => x.desc = describeSingle(x.b, "added", snapB));
+    // ===== Filet de sécurité : aucun orange ne s'affiche sans preuve chiffrée valide =====
+    // Tout élément qui échoue est RÉTROGRADÉ en « à vérifier » plutôt que présenté comme modifié.
+    diff.audit = [];
+    diff.unmeasurable = [];
+    for (const k of ["geom","verify","props","same"]) for (const x of diff[k])
+      if (x.desc.unmeasured && x.desc.unmeasured.length) diff.unmeasurable.push({ k, x });
+    const BAD = /[∞?]|NaN|Infinity|undefined|null/;
+    for (const x of [...diff.geom]){
+      const D = x.desc, id = (x.b || x.a).guid, bad = [];
+      if (!D.geo.length) bad.push("aucune ligne géométrique");
+      if (!D.geo.some(l => /\d/.test(l))) bad.push("aucune valeur chiffrée");
+      if (D.geo.some(l => BAD.test(l))) bad.push("valeur non numérique dans la mesure");
+      if (!D.proof) bad.push("aucune preuve enregistrée");
+      if (bad.length){
+        diff.audit.push(`${id} : ${bad.join(", ")}`);
+        D.level = "verify";
+        D.interp = "À vérifier (contrôle interne) : " + bad.join(", ") + ". " + D.interp;
+        D.short = "à vérifier · " + D.short.replace(/^à vérifier · /, "");
+        diff.geom.splice(diff.geom.indexOf(x), 1);
+        diff.verify.push(x);
+      }
+    }
+    for (const k of ["verify","props","same"]) for (const x of diff[k]){
+      const D = x.desc;
+      if (D.geo.some(l => BAD.test(l))) diff.audit.push(`${(x.b || x.a).guid} : valeur non numérique (${k})`);
+    }
+
     // index « objet cliqué dans la vue » -> ligne de la liste
     diff.idxA = new Map(); diff.idxB = new Map();
     for (const k of ["added","deleted","geom","verify","props","same"]) for (const x of diff[k]){
@@ -993,9 +1064,11 @@ async function run(){
     const opNote = (snapA.openings + snapB.openings) ? "\nRéservations (IfcOpeningElement) masquées par défaut dans Trimble Connect : œil ▾ de la barre d'outils → « IFC Opening Elements » pour les voir." : "";
     const qty = [...snapB.map.values()].some(o => o.hasQty);
     const qtyNote = qty ? "" : "\nAucune quantité (volume/surface) dans cette maquette : un trou modélisé sans ouverture IFC ne sera pas détecté. Demander l'export IFC avec les quantités de base.";
-    const chk = diff.incoherent ? `\n⛔ CONTRÔLE : ${diff.incoherent} élément(s) dont la couleur ne correspond pas à la fiche. Ne pas diffuser ce résultat, signaler le cas.` : "\n✔ Contrôle de cohérence : chaque couleur correspond à sa fiche.";
+    const unm = diff.unmeasurable.length ? `\n${diff.unmeasurable.length} objet(s) dont une grandeur n'a pas pu être comparée (donnée absente dans une version) : non déclarés modifiés, listés dans le CSV.` : "";
+    const aud = diff.audit.length ? `\n⚠ ${diff.audit.length} élément(s) rétrogradé(s) en « à vérifier » par le contrôle interne (preuve insuffisante) : ${diff.audit.slice(0,3).join(" | ")}${diff.audit.length > 3 ? " …" : ""}` : "";
+    const chk = diff.incoherent ? `\n⛔ CONTRÔLE : ${diff.incoherent} élément(s) dont la couleur ne correspond pas à la fiche. Ne pas diffuser ce résultat, signaler le cas.` : "\n✔ Contrôle de cohérence : chaque orange repose sur une mesure chiffrée et une preuve.";
     const verNote = diff.verify.length ? `\n${diff.verify.length} objet(s) en jaune « à vérifier » : écart faible non confirmé par l'IFC, ne pas présenter comme modifié(s) sans contrôle.` : "";
-    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + chk + verNote + warn + reclNote + geoNote + hidNote + opNote + qtyNote + alert);
+    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + chk + aud + unm + verNote + warn + reclNote + geoNote + hidNote + opNote + qtyNote + alert);
   }catch(e){
     progress(null);
     status("Erreur pendant « " + (step || "préparation") + " » : " + (e.message || e) + "\nAstuce : réessaie, ou teste d'abord une maquette plus légère.", true);
@@ -1069,6 +1142,8 @@ function showDetail(el, r){
     const D = r.x.desc;
     const box = document.createElement("div"); box.className = "diff";
     box.innerHTML = (D.interp ? `<div class="i">${esc(D.interp)}</div>` : "")
+      + (r.k === "geom" && D.proof ? `<div class="muted">Preuve : ${esc(D.proof)}</div>` : "")
+      + ((D.unmeasured && D.unmeasured.length) ? `<div class="t">Non comparable</div><div>• ${esc(D.unmeasured.join(" ; "))} — donnée absente ou incohérente dans une des deux versions</div>` : "")
       + (D.geo.length ? `<div class="t">Géométrie</div>` + D.geo.map(l => `<div>• ${esc(l)}</div>`).join("") : "")
       + (D.props.length ? `<div class="t">Propriétés (${D.props.length})</div>` + D.props.slice(0, 40).map(l => `<div>• ${esc(l)}</div>`).join("")
           + (D.props.length > 40 ? `<div class="muted">… ${D.props.length - 40} autres dans le CSV</div>` : "") : "");
@@ -1122,13 +1197,14 @@ function onViewerSelection(selData){
 }
 
 function exportCsv(){
-  const label = { added:"Ajouté", deleted:"Supprimé", geom:"Géométrie modifiée", verify:"Géométrie à vérifier", props:"Propriétés modifiées" };
+  const label = { added:"Ajouté", deleted:"Supprimé", geom:"Géométrie modifiée", verify:"Géométrie à vérifier", props:"Propriétés modifiées", unmeas:"Non comparable (inchangé par ailleurs)" };
   const q = v => `"${String(v ?? "").replace(/"/g,'""')}"`;
-  const lines = [["Statut","GUID","Nom","Classe","Appariement","Interprétation","Changements géométriques","Propriétés modifiées"].map(q).join(";")];
-  for (const r of rowsFor(null)){
+  const lines = [["Statut","GUID","Nom","Classe","Appariement","Preuve","Non comparable","Interprétation","Changements géométriques","Propriétés modifiées"].map(q).join(";")];
+  const extra = diff.unmeasurable.filter(u => u.k === "same").map(u => ({ k: "unmeas", o: u.x.b || u.x.a, x: u.x }));
+  for (const r of rowsFor(null).concat(extra)){
     const how = (r.x.a && r.x.b) ? (r.x.viaGeo ? "Géométrie" : "GUID") : "";
     const D = r.x.desc || { interp: "", geo: [], props: [] };
-    lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, how, D.interp, D.geo.join("\n"), D.props.join("\n")].map(q).join(";"));
+    lines.push([label[r.k], r.o.guid, r.o.name, r.o.cls, how, D.proof || "", (D.unmeasured || []).join(" ; "), D.interp, D.geo.join("\n"), D.props.join("\n")].map(q).join(";"));
   }
   const blob = new Blob(["﻿" + lines.join("\r\n")], { type:"text/csv;charset=utf-8" });
   const a = document.createElement("a");
