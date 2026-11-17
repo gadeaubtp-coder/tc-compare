@@ -63,7 +63,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.0</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.1</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -147,6 +147,7 @@ const ID_PROP = /›\s*(guid|globalid|global id|ifc ?guid|ifcguid|tekla ?guid|un
 // propriétés de quantité : un changement = géométrie modifiée (capte les trous / réservations qui ne changent pas l'emprise)
 const QTY_PROP = /›\s*(net|gross)?\s*(volume|side ?area|area|surface|aire|surface nette|surface brute|volume net|volume brut|footprint ?area|cross ?section ?area|perimeter|périmètre)$/i;
 const OPENING = /opening|ouverture|réservation|reservation/i;
+const SOLID_PROP = /^calculatedgeometryvalues\s*›\s*issolid$/i;   // 0 = Trimble n'a pas pu fermer le solide
 const COG_PROP = /^calculatedgeometryvalues\s*›\s*centerofgravity([xyz])$/i;   // calculé par Trimble Connect
 const OBB_PROP = /^orientedboundingbox\s*›/i;                                    // axes instables d'un export à l'autre : ignorés
 const GEO_SET  = /^calculatedgeometryvalues\s*›/i;
@@ -555,6 +556,8 @@ async function snapshot(modelId, label, onP){
         ph: hashStr(keys.map(k=>k+"="+flat[k]).join("|")),
         phNoId: hashStr(keys.filter(k=>!ID_PROP.test(k)).map(k=>k+"="+flat[k]).join("|")),
         hasQty: keys.some(k => QTY_PROP.test(k) || COG_PROP.test(k)),
+        solid: (() => { const k = keys.find(k => SOLID_PROP.test(k)); if (!k) return undefined;
+                        const v = String(flat[k]).trim().toLowerCase(); return !(v === "0" || v === "false" || v === "no"); })(),
         flat
       });
     });
@@ -771,13 +774,26 @@ function describe(x){
   // Si Trimble Connect a calculé la valeur (CalculatedGeometryValues), c'est elle qui fait foi ;
   // les quantités de l'exporteur (Qto, Revit…) sont alors traitées comme des métadonnées.
   const used = new Set();
+  // Trimble ne calcule volume / surface / centre de gravité que s'il a pu reconstruire un solide fermé.
+  // IsSolid = 0 => ces valeurs valent 0 ou sont arbitraires : ce ne sont PAS des mesures.
+  const solidKO = a.solid === false || b.solid === false;
+  if (solidKO){
+    Object.keys(a.flat).concat(Object.keys(b.flat)).filter(k => GEO_SET.test(k)).forEach(k => used.add(k));
+    unmeasured.push(`géométrie calculée par Trimble (solide non fermé dans ${a.solid === false ? (b.solid === false ? "les deux versions" : "la version A") : "la version B"} : IsSolid = 0)`);
+  }
   for (const [re, unit, lab, kind] of [[/volume/i, "m³", "Volume", "vol"], [/area|surface|aire/i, "m²", "Surface", "area"]]){
     const common = Object.keys(a.flat).filter(k => re.test(k) && (QTY_PROP.test(k) || GEO_SET.test(k)) && k in b.flat && !isNaN(num(a.flat[k])) && !isNaN(num(b.flat[k])));
-    const calc = common.filter(k => GEO_SET.test(k));
-    const k = calc[0] || common.find(k => /net/i.test(k)) || common[0];
+    const calc = solidKO ? [] : common.filter(k => GEO_SET.test(k));
+    const k = calc[0] || common.find(k => /net/i.test(k) && !GEO_SET.test(k)) || common.find(k => !GEO_SET.test(k)) || (solidKO ? null : common[0]);
     if (!k) continue;
     used.add(k);
     const qa = { v: num(a.flat[k]) }, qb = { v: num(b.flat[k]) };
+    // un volume / une surface ne peut pas être nul ou négatif pour un objet réel :
+    // une valeur <= 0 d'un seul côté signifie « non calculé », jamais « devenu nul »
+    if ((qa.v <= 0) !== (qb.v <= 0)){
+      unmeasured.push(`${lab} (valeur ${qa.v <= 0 ? "absente" : "devenue"} nulle ou négative : non calculée par Trimble, pas une mesure)`);
+      continue;
+    }
     // rapport voisin d'une puissance de 1000 => changement d'unité à l'export, pas de la géométrie
     if (qa.v && qb.v){
       const r = qb.v / qa.v;
@@ -806,9 +822,10 @@ function describe(x){
     }
   }
   // centre de gravité : toujours signalé s'il bouge ; on précise la part non expliquée par l'emprise
-  const ca = cogVec(a), cb2 = cogVec(b);
+  const ca = solidKO ? null : cogVec(a), cb2 = solidKO ? null : cogVec(b);
   const cogOk = ca && cb2 && ca.unit === cb2.unit;          // unités discordantes = donnée non comparable
   if (!cogOk && (ca || cb2)) unmeasured.push("centre de gravité");
+  if (solidKO) Object.keys(a.flat).concat(Object.keys(b.flat)).filter(k => COG_PROP.test(k)).forEach(k => used.add(k));
   const ga = cogOk ? ca.v : null, gb = cogOk ? cb2.v : null;
   if (ga && gb){
     Object.keys(a.flat).filter(k => COG_PROP.test(k)).forEach(k => used.add(k));
@@ -878,6 +895,7 @@ function describe(x){
 
   // interprétation
   const it = [];
+  if (solidKO) it.push(`Trimble n'a pas pu reconstruire un solide fermé pour cet objet (IsSolid = 0) : volume, surface et centre de gravité non exploitables. À traiter comme un défaut de modélisation ou d'export, pas comme une modification géométrique`);
   if (reclass) it.push(`reclassification IFC (${clsName(a.cls)} → ${clsName(b.cls)})`);
   if (opsChg) it.push(nb > na ? "réservation(s) ajoutée(s)" : nb < na ? "réservation(s) supprimée(s)" : "réservation(s) modifiée(s)");
   if (rotated) it.push("objet pivoté ou réorienté (volume conservé) — l'emprise change, les dimensions propres de l'objet non");
@@ -898,6 +916,7 @@ function describe(x){
   if (moved > tol && !resized) short.push(`déplacé ${nf(moved)} mm`);
   if (vq){ const m = vq.match(/\(([^ ]+) m³/); if (m) short.push(`volume ${m[1]} m³`); }
   if (inner && !vq && !opsChg) short.push("forme intérieure modifiée");
+  if (solidKO) short.push("solide non fermé (IsSolid = 0)");
   if (reclass) short.push(`${clsName(a.cls)} → ${clsName(b.cls)}`);
   const np = props.length - (reclass ? 1 : 0);
   if (np) short.push(np === 1 ? props[reclass ? 1 : 0].split(" : ")[0].split(" › ").pop() + " modifié(e)" : `${np} propriétés modifiées`);
