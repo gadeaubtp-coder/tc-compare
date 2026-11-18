@@ -63,7 +63,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.4</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.5</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -816,37 +816,55 @@ function describe(x){
   // SANS que l'objet change. Signature de ce bruit : volume calculé conservé, un seul axe touché,
   // écart faible devant la dimension. Une vraie rotation touche au moins deux axes ; un vrai
   // redimensionnement change le volume ; une vraie translation ne change aucune dimension.
+  // ---- Verdict sur l'emprise ----
+  // L'emprise est une boîte alignée sur X-Y-Z, reconstruite par Trimble à partir du solide.
+  // Pour un objet oblique elle ne correspond à aucune dimension propre de l'objet, et elle peut
+  // changer de plusieurs cm quand Trimble reconstruit la géométrie autrement, SANS que l'objet change.
+  // Règle : une emprise dont les DIMENSIONS changent ne vaut preuve que si le volume le confirme.
+  // Une emprise qui se déplace sans changer de dimensions reste une preuve de déplacement.
   const volKeyA = Object.keys(a.flat).find(k => GEO_SET.test(k) && /volume/i.test(k));
-  const volConserved = (() => {
-    if (!volKeyA || !(volKeyA in b.flat)) return false;
-    const va = num(a.flat[volKeyA]), vb = num(b.flat[volKeyA]);
-    if (!isFinite(va) || !isFinite(vb) || va <= 0 || vb <= 0) return false;
-    return Math.abs(vb - va) <= Math.max(TOL.qtyAbs, TOL.qtyRel * Math.max(va, vb));
-  })();
-  const maxDd = Math.max(0, ...dimLines.map(L => Math.abs(L.dd)));
+  const vA0 = volKeyA ? num(a.flat[volKeyA]) : NaN, vB0 = (volKeyA && volKeyA in b.flat) ? num(b.flat[volKeyA]) : NaN;
+  const volAvailable = isFinite(vA0) && isFinite(vB0) && vA0 > 0 && vB0 > 0;
+  const volConserved = volAvailable && Math.abs(vB0 - vA0) <= Math.max(TOL.qtyAbs, TOL.qtyRel * Math.max(vA0, vB0));
   const maxRel = Math.max(0, ...dimLines.map(L => Math.abs(L.dd) / Math.max(L.dA, L.dB, 1)));
-  const meshNoise = dimLines.length === 1 && volConserved && !qtyChg
-                 && maxRel <= TOL.meshRel && bbMoved <= Math.max(tol, maxDd);
+  const dimTxt = L => `Emprise ${dimLabel[L.i]} : ${nf(L.dA)} → ${nf(L.dB)} mm (${sg(L.dd)} mm)`;
+  const movTxt = () => `${dimLines.length ? "Centre de l'emprise déplacé" : "Déplacé"} de ${nf(bbMoved)} mm (${AX.map((ax,i) => "Δ" + ax + " " + sg(bbShift[i])).join(" · ")} mm)`;
   let rotated = false;
-  if (meshNoise){
-    unmeasured.push(`emprise (bruit de reconstruction : ${sg(dimLines[0].dd)} mm sur ${dimLabel[dimLines[0].i]}, soit ${nf(maxRel*100, 3)} % — volume conservé, facettage des formes courbes)`);
-  } else {
-    resized = dimLines.length > 0;
+
+  if (!dimLines.length){
+    // dimensions conservées : l'emprise entière se déplace => vrai déplacement
     moved = bbMoved;
-    for (const L of dimLines){ sevMm(Math.abs(L.dd)); geo.push(`Emprise ${dimLabel[L.i]} : ${nf(L.dA)} → ${nf(L.dB)} mm (${sg(L.dd)} mm)`); }
-    if (moved > tol){
-      sevMm(moved);
-      geo.push(`${resized ? "Centre de l'emprise déplacé" : "Déplacé"} de ${nf(moved)} mm (${AX.map((ax,i) => "Δ" + ax + " " + sg(bbShift[i])).join(" · ")} mm)`);
+    if (moved > tol){ sevMm(moved); geo.push(movTxt()); }
+  } else if (volConserved){
+    if (dimLines.length === 1){
+      // une seule face de la boîte bouge, à volume strictement conservé :
+      // un vrai allongement ou un vrai rabotage changerait le volume => le solide n'a pas changé
+      const txt = `emprise (${sg(dimLines[0].dd)} mm sur ${dimLabel[dimLines[0].i]}, soit ${nf(maxRel*100, 3)} % — volume conservé à ${nf(vA0, 3)} m³ : la forme du solide n'a pas changé, reconstruction Trimble différente)`;
+      unmeasured.push(txt);
+      if (maxRel > TOL.meshRel){ smallOther = true; geo.push(`Emprise modifiée de ${sg(dimLines[0].dd)} mm sur ${dimLabel[dimLines[0].i]} MAIS volume conservé (${nf(vA0, 3)} m³) : à vérifier, le solide semble inchangé`); }
+    } else {
+      // plusieurs axes touchés à volume conservé => réorientation réelle
+      resized = true; moved = bbMoved; rotated = true;
+      for (const L of dimLines){ sevMm(Math.abs(L.dd)); geo.push(dimTxt(L)); }
+      if (moved > tol){ sevMm(moved); geo.push(movTxt()); }
+      geo.push(`Volume conservé (${nf(vA0, 3)} m³) malgré l'emprise modifiée : objet pivoté ou réorienté, et non redimensionné`);
     }
-    // rotation : une réorientation réelle touche au moins DEUX axes de l'emprise
-    if (dimLines.length >= 2 && volConserved && !qtyChg){
-      rotated = true;
-      geo.push(`Volume conservé (${nf(num(a.flat[volKeyA]), 3)} m³) malgré l'emprise modifiée : objet pivoté ou réorienté, et non redimensionné`);
-    }
+  } else if (volAvailable){
+    // le volume a changé : le redimensionnement est corroboré
+    resized = true; moved = bbMoved;
+    for (const L of dimLines){ sevMm(Math.abs(L.dd)); geo.push(dimTxt(L)); }
+    if (moved > tol){ sevMm(moved); geo.push(movTxt()); }
+  } else {
+    // aucun volume calculé : l'emprise seule ne peut pas prouver un redimensionnement => jamais orange
+    resized = true; moved = bbMoved;
+    for (const L of dimLines) geo.push(dimTxt(L));
+    if (moved > tol) geo.push(movTxt());
+    smallOther = true;
+    unmeasured.push("volume calculé indisponible : un changement de dimensions de l'emprise ne peut pas être corroboré");
   }
   // centre de gravité : toujours signalé s'il bouge ; on précise la part non expliquée par l'emprise
   const ca = solidKO ? null : cogVec(a), cb2 = solidKO ? null : cogVec(b);
-  const cogOk = ca && cb2 && ca.unit === cb2.unit;          // unités discordantes = donnée non comparable
+  const cogOk = ca && cb2 && ca.unit === cb2.unit;
   if (!cogOk && (ca || cb2)) unmeasured.push("centre de gravité");
   if (solidKO) Object.keys(a.flat).concat(Object.keys(b.flat)).filter(k => COG_PROP.test(k)).forEach(k => used.add(k));
   const ga = cogOk ? ca.v : null, gb = cogOk ? cb2.v : null;
