@@ -63,7 +63,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.3</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.4</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -577,12 +577,12 @@ async function snapshot(modelId, label, onP){
       try { hosts = await API.viewer.getHierarchyParents(modelId, [op.rid], 8, false) || []; } catch(e){ if (isTimeout(e)) throw e; }
       for (const h of hosts){
         const host = byRid.get(h.id);
-        if (host){ (host._ops = host._ops || []).push(op.bb || null); op.hostRid = host.rid; nOpen++; }
+        if (host){ (host._ops = host._ops || []).push(op.bb || null); (host._opg = host._opg || []).push(op.guid); op.hostRid = host.rid; nOpen++; }
       }
     }));
     onP && onP(1, `${label} : réservations ${Math.min(i + 6, openings.length)} / ${openings.length}`);
   }
-  for (const o of map.values()) if (o._ops){ o.ops = o._ops; o.nOps = o._ops.length; delete o._ops; }
+  for (const o of map.values()) if (o._ops){ o.ops = o._ops; o.opGuids = o._opg || []; o.nOps = o._ops.length; delete o._ops; delete o._opg; }
   return { map, total: ids.length, noGuid, spatial, openings: openings.length, hosted: nOpen };
 }
 
@@ -872,10 +872,35 @@ function describe(x){
   // réservations
   const na = a.nOps || 0, nb = b.nOps || 0;
   const od = opsDev(a.ops || [], b.ops || []);
-  if (!od.measurable) unmeasured.push(`réservations (${nb}, emprise non lisible)`);
-  const opsChg = od.count || (od.measurable && isFinite(od.dev) && od.dev > tol);
-  if (od.count) big = true; else if (opsChg) sevMm(od.dev);
-  if (opsChg) geo.push(na === nb ? `Réservations : ${nb}, dont au moins une déplacée ou redimensionnée (écart max ${nf(od.dev, od.dev < 10 ? 1 : 0)} mm)` : `Réservations : ${na} → ${nb} (${sg(nb - na)})`);
+  let opsChg = false, opsCount = false;
+
+  // Le nombre de réservations vient du rattachement (IfcRelVoidsElement) que Trimble reconstruit à l'import.
+  // Ce rattachement échoue justement quand Trimble n'a pas pu fermer le solide : on ne conclut donc pas.
+  if (solidKO){
+    unmeasured.push(`réservations (${na} → ${nb} : rattachement non reconstruit, solide non fermé)`);
+  } else if (od.count){
+    // Une réservation « disparue » doit avoir disparu de la MAQUETTE, pas seulement du mur.
+    // Si elle existe toujours dans l'autre version, c'est son rattachement qui a changé, pas la géométrie.
+    const ga = new Set(a.opGuids || []), gb = new Set(b.opGuids || []);
+    const partis = [...ga].filter(g => !gb.has(g));
+    const venus  = [...gb].filter(g => !ga.has(g));
+    const partisReels = partis.filter(g => snapB && !snapB.map.has(g));
+    const venusReels  = venus.filter(g => snapA && !snapA.map.has(g));
+    const fantomes = (partis.length - partisReels.length) + (venus.length - venusReels.length);
+    if (partisReels.length || venusReels.length){
+      opsChg = true; opsCount = true; big = true;
+      geo.push(`Réservations : ${na} → ${nb} (${sg(nb - na)}) — ${partisReels.length ? partisReels.length + " supprimée(s) de la maquette" : ""}${partisReels.length && venusReels.length ? ", " : ""}${venusReels.length ? venusReels.length + " ajoutée(s)" : ""}`);
+    } else if (fantomes){
+      unmeasured.push(`réservations (${na} → ${nb} : ${fantomes} réservation(s) toujours présente(s) dans l'autre version mais plus rattachée(s) à cet objet — rattachement Trimble, pas une suppression)`);
+    } else {
+      unmeasured.push(`réservations (${na} → ${nb} : identité des réservations non lisible)`);
+    }
+  } else if (!od.measurable){
+    unmeasured.push(`réservations (${nb}, emprise non lisible)`);
+  } else if (isFinite(od.dev) && od.dev > tol){
+    opsChg = true; sevMm(od.dev);
+    geo.push(`Réservations : ${nb}, dont au moins une déplacée ou redimensionnée (écart max ${nf(od.dev, od.dev < 10 ? 1 : 0)} mm)`);
+  }
 
   // confirmation par l'IFC : quantités écrites par le logiciel auteur (Revit, Qto…), présentes dans les deux versions
   const ifcQ = { vol: 0, area: 0 }, conf = [];
@@ -920,7 +945,7 @@ function describe(x){
   const it = [];
   if (solidKO) it.push(`Trimble n'a pas pu reconstruire un solide fermé pour cet objet (IsSolid = 0) : volume, surface et centre de gravité non exploitables. À traiter comme un défaut de modélisation ou d'export, pas comme une modification géométrique`);
   if (reclass) it.push(`reclassification IFC (${clsName(a.cls)} → ${clsName(b.cls)})`);
-  if (opsChg) it.push(nb > na ? "réservation(s) ajoutée(s)" : nb < na ? "réservation(s) supprimée(s)" : "réservation(s) modifiée(s)");
+  if (opsChg) it.push(opsCount ? (nb > na ? "réservation(s) ajoutée(s)" : "réservation(s) supprimée(s)") : "réservation(s) déplacée(s) ou redimensionnée(s)");
   if (rotated) it.push("objet pivoté ou réorienté (volume conservé) — l'emprise change, les dimensions propres de l'objet non");
   else if (resized) it.push("objet redimensionné");
   else if (moved > tol) it.push(qtyChg || inner ? "objet déplacé et modifié" : "objet déplacé, forme inchangée");
@@ -934,7 +959,7 @@ function describe(x){
   // résumé court pour la liste
   const short = [];
   const vq = geo.find(l => l.startsWith("Volume"));
-  if (opsChg) short.push(na === nb ? "réservation modifiée" : `réservations ${sg(nb - na)}`);
+  if (opsChg) short.push(opsCount ? `réservations ${sg(nb - na)}` : "réservation modifiée");
   if (rotated) short.push("pivoté"); else if (resized) short.push("redimensionné");
   if (moved > tol && !resized) short.push(`déplacé ${nf(moved)} mm`);
   if (vq){ const m = vq.match(/\(([^ ]+) m³/); if (m) short.push(`volume ${m[1]} m³`); }
