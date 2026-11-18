@@ -63,7 +63,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.1</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.3</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -84,8 +84,8 @@
 
     <details style="margin-top:8px">
       <summary class="muted" style="cursor:pointer">Options</summary>
-      <label for="ignore">Propriétés à ignorer (séparées par des virgules, ex. « Date de modification, Revision »)</label>
-      <input type="text" id="ignore" placeholder="aucune">
+      <label for="ignore">Propriétés à ignorer (séparées par des virgules). Pré-rempli avec le journal d'import de Trimble, qui change à chaque dépôt sans que la maquette change. Vide ce champ pour le voir.</label>
+      <input type="text" id="ignore" value="Warning.Description,Warning.Type,Warning.Reference" placeholder="aucune">
       <label for="tol">Tolérance géométrique (mm)</label>
       <input type="text" id="tol" value="1">
       <label class="chk"><input type="checkbox" id="geomatch" checked> Si les GUID diffèrent, apparier les objets par géométrie</label>
@@ -93,6 +93,8 @@
       <input type="text" id="cogTol" value="2">
       <label for="qtyTol">Écart min. de volume / surface (%)</label>
       <input type="text" id="qtyTol" value="0.01">
+      <label for="meshPct">Bruit de facettage des formes courbes : emprise modifiée sur un seul axe, à volume conservé, en dessous de (% de la dimension)</label>
+      <input type="text" id="meshPct" value="0.5">
       <label for="bigMm">Orange sans confirmation IFC au-delà de (mm) — sinon jaune « à vérifier »</label>
       <input type="text" id="bigMm" value="20">
       <label for="bigPct">Orange sans confirmation IFC au-delà de (% volume / surface)</label>
@@ -157,7 +159,7 @@ const clsName = c => { const t = String(c || ""); const m = t.match(/^ifc(.*)$/i
 const isGeoKey = k => GEO_SET.test(k) || OBB_PROP.test(k) || QTY_PROP.test(k);
 const num = v => { if (typeof v === "number") return v; const t = String(v ?? "").trim().replace(",", "."); return /^[-+]?\d*\.?\d+(e[-+]?\d+)?$/i.test(t) ? parseFloat(t) : NaN; };
 // réglages de tolérance (lus dans Options au lancement)
-let TOL = { qtyRel: 1e-4, qtyAbs: 5e-5, cogMm: 2, numRel: 1e-6, geoMm: 1, bigMm: 20, bigPct: 5 };
+let TOL = { qtyRel: 1e-4, qtyAbs: 5e-5, cogMm: 2, numRel: 1e-6, geoMm: 1, bigMm: 20, bigPct: 5, meshRel: 0.005 };
 // égalité « métier » d'une propriété : tolère le bruit numérique des exports
 function valEq(k, va, vb){
   if (OBB_PROP.test(k)) return true;
@@ -751,6 +753,7 @@ function describe(x){
   const unmeasured = [];   // grandeurs qu'on n'a PAS pu comparer : jamais une raison de déclarer « modifié »
   if (!a.bb || !b.bb) unmeasured.push("emprise");
   const dimLines = [];
+  let bbShift = [0,0,0], bbMoved = 0;
   const sevMm = v => { if (v > TOL.bigMm && !guessed) big = true; else smallOther = true; };
 
   // emprise : dimensions et position
@@ -759,16 +762,11 @@ function describe(x){
     const cA = [0,1,2].map(i => (a.bb[i] + a.bb[i+3]) * 500), cB = [0,1,2].map(i => (b.bb[i] + b.bb[i+3]) * 500);
     for (let i = 0; i < 3; i++){
       const dd = dB[i] - dA[i];
-      if (Math.abs(dd) > tol){ resized = true; sevMm(Math.abs(dd)); dimLines.push({ i, dA: dA[i], dB: dB[i], dd }); }
+      if (Math.abs(dd) > tol) dimLines.push({ i, dA: dA[i], dB: dB[i], dd });
     }
-    for (const L of dimLines) geo.push(`Emprise ${dimLabel[L.i]} : ${nf(L.dA)} → ${nf(L.dB)} mm (${sg(L.dd)} mm)`);
-    const sh = [0,1,2].map(i => cB[i] - cA[i]);
-    moved = Math.hypot(...sh);
-    if (moved > tol){
-      sevMm(moved);
-      geo.push(`${resized ? "Centre de l'emprise déplacé" : "Déplacé"} de ${nf(moved)} mm (${AX.map((ax,i) => "Δ" + ax + " " + sg(sh[i])).join(" · ")} mm)`);
-    }
-    x._bbShift = sh;
+    bbShift = [0,1,2].map(i => cB[i] - cA[i]);
+    bbMoved = Math.hypot(...bbShift);
+    x._bbShift = bbShift;
   }
   // volume / surface : seulement des valeurs présentes et numériques dans LES DEUX versions.
   // Si Trimble Connect a calculé la valeur (CalculatedGeometryValues), c'est elle qui fait foi ;
@@ -812,13 +810,38 @@ function describe(x){
     const dq = Math.abs(dv) >= 0.001 ? 3 : 4;   // 4 décimales si l'écart est inférieur au millième
     geo.push(`${lab} : ${nf(qa.v, dq)} → ${nf(qb.v, dq)} ${unit} (${sg(dv, dq)} ${unit}, ${sg(pct, 2)} %)`);
   }
-  // emprise modifiée mais volume conservé => rotation / réorientation, pas un redimensionnement
+  // ---- Verdict sur l'emprise, maintenant que le volume est connu ----
+  // L'emprise est calculée sur le maillage d'affichage : sur les formes courbes (cylindres, isolateurs,
+  // tubes), le facettage peut varier d'un import à l'autre et déplacer les points extrêmes de quelques mm,
+  // SANS que l'objet change. Signature de ce bruit : volume calculé conservé, un seul axe touché,
+  // écart faible devant la dimension. Une vraie rotation touche au moins deux axes ; un vrai
+  // redimensionnement change le volume ; une vraie translation ne change aucune dimension.
+  const volKeyA = Object.keys(a.flat).find(k => GEO_SET.test(k) && /volume/i.test(k));
+  const volConserved = (() => {
+    if (!volKeyA || !(volKeyA in b.flat)) return false;
+    const va = num(a.flat[volKeyA]), vb = num(b.flat[volKeyA]);
+    if (!isFinite(va) || !isFinite(vb) || va <= 0 || vb <= 0) return false;
+    return Math.abs(vb - va) <= Math.max(TOL.qtyAbs, TOL.qtyRel * Math.max(va, vb));
+  })();
+  const maxDd = Math.max(0, ...dimLines.map(L => Math.abs(L.dd)));
+  const maxRel = Math.max(0, ...dimLines.map(L => Math.abs(L.dd) / Math.max(L.dA, L.dB, 1)));
+  const meshNoise = dimLines.length === 1 && volConserved && !qtyChg
+                 && maxRel <= TOL.meshRel && bbMoved <= Math.max(tol, maxDd);
   let rotated = false;
-  if (resized && !qtyChg){
-    const vA = pickQty(a, /volume/i), vB = pickQty(b, /volume/i);
-    if (vA && vB && vA.v && Math.abs(vB.v - vA.v) <= Math.max(TOL.qtyAbs, TOL.qtyRel * Math.max(vA.v, vB.v))){
+  if (meshNoise){
+    unmeasured.push(`emprise (bruit de reconstruction : ${sg(dimLines[0].dd)} mm sur ${dimLabel[dimLines[0].i]}, soit ${nf(maxRel*100, 3)} % — volume conservé, facettage des formes courbes)`);
+  } else {
+    resized = dimLines.length > 0;
+    moved = bbMoved;
+    for (const L of dimLines){ sevMm(Math.abs(L.dd)); geo.push(`Emprise ${dimLabel[L.i]} : ${nf(L.dA)} → ${nf(L.dB)} mm (${sg(L.dd)} mm)`); }
+    if (moved > tol){
+      sevMm(moved);
+      geo.push(`${resized ? "Centre de l'emprise déplacé" : "Déplacé"} de ${nf(moved)} mm (${AX.map((ax,i) => "Δ" + ax + " " + sg(bbShift[i])).join(" · ")} mm)`);
+    }
+    // rotation : une réorientation réelle touche au moins DEUX axes de l'emprise
+    if (dimLines.length >= 2 && volConserved && !qtyChg){
       rotated = true;
-      geo.push(`Volume conservé (${nf(vA.v, 3)} m³) malgré l'emprise modifiée : objet pivoté ou réorienté, et non redimensionné`);
+      geo.push(`Volume conservé (${nf(num(a.flat[volKeyA]), 3)} m³) malgré l'emprise modifiée : objet pivoté ou réorienté, et non redimensionné`);
     }
   }
   // centre de gravité : toujours signalé s'il bouge ; on précise la part non expliquée par l'emprise
@@ -1019,7 +1042,7 @@ async function run(){
 
     const nearM = (parseFloat(String($("near").value).replace(",", ".")) || 100) / 1000;
     const pf = (id, d) => { const v = parseFloat(String($(id).value).replace(",", ".")); return isFinite(v) && v >= 0 ? v : d; };
-    TOL = { ...TOL, cogMm: pf("cogTol", 2), qtyRel: pf("qtyTol", 0.01) / 100, geoMm: pf("tol", 1), bigMm: pf("bigMm", 20), bigPct: pf("bigPct", 5) };
+    TOL = { ...TOL, cogMm: pf("cogTol", 2), qtyRel: pf("qtyTol", 0.01) / 100, geoMm: pf("tol", 1), bigMm: pf("bigMm", 20), bigPct: pf("bigPct", 5), meshRel: pf("meshPct", 0.5) / 100 };
     diff = compare(snapA, snapB, { geoMatch: $("geomatch").checked, near: nearM });
     diff.added.forEach(x => x.desc = describeSingle(x.b, "added", snapB));
     // ===== Filet de sécurité : aucun orange ne s'affiche sans preuve chiffrée valide =====
