@@ -63,7 +63,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.5</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.6</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -93,8 +93,6 @@
       <input type="text" id="cogTol" value="2">
       <label for="qtyTol">Écart min. de volume / surface (%)</label>
       <input type="text" id="qtyTol" value="0.01">
-      <label for="meshPct">Bruit de facettage des formes courbes : emprise modifiée sur un seul axe, à volume conservé, en dessous de (% de la dimension)</label>
-      <input type="text" id="meshPct" value="0.5">
       <label for="bigMm">Orange sans confirmation IFC au-delà de (mm) — sinon jaune « à vérifier »</label>
       <input type="text" id="bigMm" value="20">
       <label for="bigPct">Orange sans confirmation IFC au-delà de (% volume / surface)</label>
@@ -159,7 +157,7 @@ const clsName = c => { const t = String(c || ""); const m = t.match(/^ifc(.*)$/i
 const isGeoKey = k => GEO_SET.test(k) || OBB_PROP.test(k) || QTY_PROP.test(k);
 const num = v => { if (typeof v === "number") return v; const t = String(v ?? "").trim().replace(",", "."); return /^[-+]?\d*\.?\d+(e[-+]?\d+)?$/i.test(t) ? parseFloat(t) : NaN; };
 // réglages de tolérance (lus dans Options au lancement)
-let TOL = { qtyRel: 1e-4, qtyAbs: 5e-5, cogMm: 2, numRel: 1e-6, geoMm: 1, bigMm: 20, bigPct: 5, meshRel: 0.005 };
+let TOL = { qtyRel: 1e-4, qtyAbs: 5e-5, cogMm: 2, numRel: 1e-6, geoMm: 1, bigMm: 20, bigPct: 5 };
 // égalité « métier » d'une propriété : tolère le bruit numérique des exports
 function valEq(k, va, vb){
   if (OBB_PROP.test(k)) return true;
@@ -839,9 +837,10 @@ function describe(x){
     if (dimLines.length === 1){
       // une seule face de la boîte bouge, à volume strictement conservé :
       // un vrai allongement ou un vrai rabotage changerait le volume => le solide n'a pas changé
-      const txt = `emprise (${sg(dimLines[0].dd)} mm sur ${dimLabel[dimLines[0].i]}, soit ${nf(maxRel*100, 3)} % — volume conservé à ${nf(vA0, 3)} m³ : la forme du solide n'a pas changé, reconstruction Trimble différente)`;
-      unmeasured.push(txt);
-      if (maxRel > TOL.meshRel){ smallOther = true; geo.push(`Emprise modifiée de ${sg(dimLines[0].dd)} mm sur ${dimLabel[dimLines[0].i]} MAIS volume conservé (${nf(vA0, 3)} m³) : à vérifier, le solide semble inchangé`); }
+      // Un allongement ou un rabotage réel de cette ampleur changerait le volume. Volume conservé
+      // au centième de pour cent = preuve positive que le solide est identique, quelle que soit
+      // l'ampleur de l'écart d'emprise. Le centre de gravité, contrôlé plus bas, reste un second garde-fou.
+      unmeasured.push(`emprise (${sg(dimLines[0].dd)} mm sur ${dimLabel[dimLines[0].i]}, soit ${nf(maxRel*100, 3)} % — volume conservé à ${nf(vA0, 3)} m³ : la forme du solide n'a pas changé, reconstruction Trimble différente)`);
     } else {
       // plusieurs axes touchés à volume conservé => réorientation réelle
       resized = true; moved = bbMoved; rotated = true;
@@ -1085,7 +1084,7 @@ async function run(){
 
     const nearM = (parseFloat(String($("near").value).replace(",", ".")) || 100) / 1000;
     const pf = (id, d) => { const v = parseFloat(String($(id).value).replace(",", ".")); return isFinite(v) && v >= 0 ? v : d; };
-    TOL = { ...TOL, cogMm: pf("cogTol", 2), qtyRel: pf("qtyTol", 0.01) / 100, geoMm: pf("tol", 1), bigMm: pf("bigMm", 20), bigPct: pf("bigPct", 5), meshRel: pf("meshPct", 0.5) / 100 };
+    TOL = { ...TOL, cogMm: pf("cogTol", 2), qtyRel: pf("qtyTol", 0.01) / 100, geoMm: pf("tol", 1), bigMm: pf("bigMm", 20), bigPct: pf("bigPct", 5) };
     diff = compare(snapA, snapB, { geoMatch: $("geomatch").checked, near: nearM });
     diff.added.forEach(x => x.desc = describeSingle(x.b, "added", snapB));
     // ===== Filet de sécurité : aucun orange ne s'affiche sans preuve chiffrée valide =====
