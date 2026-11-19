@@ -63,7 +63,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.9</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v4.0</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -854,20 +854,46 @@ function describe(x){
   const maxRel = Math.max(0, ...dimLines.map(L => Math.abs(L.dd) / Math.max(L.dA, L.dB, 1)));
   const dimTxt = L => `Emprise ${dimLabel[L.i]} : ${nf(L.dA)} → ${nf(L.dB)} mm (${sg(L.dd)} mm)`;
   const movTxt = () => `${dimLines.length ? "Centre de l'emprise déplacé" : "Déplacé"} de ${nf(bbMoved)} mm (${AX.map((ax,i) => "Δ" + ax + " " + sg(bbShift[i])).join(" · ")} mm)`;
+  // Le centre de gravité est calculé par Trimble à partir du SOLIDE, l'emprise à partir des points
+  // extrêmes du maillage : deux chaînes de calcul distinctes. Un déplacement réel les fait bouger
+  // toutes les deux. Si l'emprise bouge et pas le centre de gravité, l'emprise se trompe.
+  const ca = solidKO ? null : cogVec(a), cb2 = solidKO ? null : cogVec(b);
+  const cogOk = !!(ca && cb2 && ca.unit === cb2.unit);
+  const ga = cogOk ? ca.v : null, gb = cogOk ? cb2.v : null;
+  const cogVecD = cogOk ? [0,1,2].map(i => gb[i] - ga[i]) : null;
+  const cogMovedMm = cogOk ? Math.hypot(...cogVecD) : 0;
+
   let rotated = false;
   const pA = placementOf(a), pB = placementOf(b);
   const placeKnown = !!(pA && pB);
   const placeSame = samePlacement(pA, pB, tol);
   if (placeSame) Object.keys(a.flat).concat(Object.keys(b.flat)).filter(k => PLACE_PROP.test(k)).forEach(k => used.add(k));
+  // Changement réel de la définition écrite dans l'IFC : c'est la preuve la plus fiable dont on dispose.
+  let placeMoved = false;
+  if (placeKnown && !placeSame){
+    const dO = Math.hypot(pB.originx - pA.originx, pB.originy - pA.originy, pB.originz - pA.originz);
+    const dE = Math.hypot(pB.extrusionx - pA.extrusionx, pB.extrusiony - pA.extrusiony, pB.extrusionz - pA.extrusionz);
+    if (dO > tol){ placeMoved = true; sevMm(dO); geo.push(`Placement IFC : origine déplacée de ${nf(dO)} mm`); }
+    if (dE > tol){ placeMoved = true; sevMm(dE); geo.push(`Placement IFC : vecteur d'extrusion modifié de ${nf(dE)} mm`); }
+  }
 
   if (placeSame && (dimLines.length || bbMoved > tol)){
     // La définition géométrique écrite dans l'IFC est identique : l'objet n'a ni bougé, ni pivoté,
     // ni changé de taille. Ce que l'emprise indique est un artefact de reconstruction Trimble.
     unmeasured.push(`emprise (${dimLines.map(L => sg(L.dd) + " mm sur " + dimLabel[L.i]).join(", ") || "centre déplacé de " + nf(bbMoved) + " mm"} — ignorée : origine et vecteur d'extrusion de l'IFC identiques, l'objet n'a ni bougé ni pivoté)`);
   } else if (!dimLines.length){
-    // dimensions conservées : l'emprise entière se déplace => vrai déplacement
+    // dimensions conservées : l'emprise entière se déplace. On exige que le centre de gravité,
+    // calculé par une autre chaîne, se déplace du MÊME vecteur.
     moved = bbMoved;
-    if (moved > tol){ sevMm(moved); geo.push(movTxt()); }
+    if (moved > tol){
+      const ecart = cogOk ? Math.hypot(...[0,1,2].map(i => cogVecD[i] - bbShift[i])) : null;
+      const confirme = placeMoved || (cogOk && ecart <= Math.max(TOL.cogMm, 0.1 * moved));
+      geo.push(movTxt() + (confirme
+        ? (cogOk ? ` — confirmé par le centre de gravité, qui se déplace du même vecteur (écart ${nf(ecart, 1)} mm)` : " — confirmé par le placement IFC")
+        : (cogOk ? ` — NON confirmé : le centre de gravité ne suit pas (il bouge de ${nf(cogMovedMm, 1)} mm, écart ${nf(ecart, 1)} mm avec l'emprise)`
+                 : " — NON confirmé : ni centre de gravité ni placement IFC disponibles pour corroborer")));
+      if (confirme) sevMm(moved); else smallOther = true;
+    }
   } else if (volConserved){
     if (dimLines.length === 1){
       // une seule face de la boîte bouge, à volume strictement conservé :
@@ -877,11 +903,18 @@ function describe(x){
       // l'ampleur de l'écart d'emprise. Le centre de gravité, contrôlé plus bas, reste un second garde-fou.
       unmeasured.push(`emprise (${sg(dimLines[0].dd)} mm sur ${dimLabel[dimLines[0].i]}, soit ${nf(maxRel*100, 3)} % — volume conservé à ${nf(vA0, 3)} m³ : la forme du solide n'a pas changé, reconstruction Trimble différente)`);
     } else {
-      // plusieurs axes touchés à volume conservé => réorientation réelle
+      // plusieurs axes touchés à volume conservé : réorientation POSSIBLE, à confirmer.
+      // Une rotation réelle déplace le centre de gravité ou modifie la définition IFC.
       resized = true; moved = bbMoved; rotated = true;
-      for (const L of dimLines){ sevMm(Math.abs(L.dd)); geo.push(dimTxt(L)); }
-      if (moved > tol){ sevMm(moved); geo.push(movTxt()); }
-      geo.push(`Volume conservé (${nf(vA0, 3)} m³) malgré l'emprise modifiée : objet pivoté ou réorienté, et non redimensionné`);
+      const confirme = placeMoved || (cogOk && cogMovedMm > TOL.cogMm);
+      for (const L of dimLines) geo.push(dimTxt(L));
+      if (moved > tol) geo.push(movTxt());
+      if (confirme){
+        geo.push(`Volume conservé (${nf(vA0, 3)} m³) malgré l'emprise modifiée : objet pivoté ou réorienté, et non redimensionné`);
+      } else {
+        smallOther = true;
+        geo.push(`Volume conservé (${nf(vA0, 3)} m³) et ${cogOk ? `centre de gravité immobile (${nf(cogMovedMm, 1)} mm)` : "centre de gravité indisponible"}${placeKnown ? ", définition IFC inchangée" : ", définition IFC indisponible"} : rotation NON confirmée — une rotation réelle déplacerait le centre de gravité ou modifierait la définition de l'IFC. Artefact de reconstruction probable.`);
+      }
     }
   } else if (volAvailable){
     // le volume a changé : le redimensionnement est corroboré
@@ -897,16 +930,13 @@ function describe(x){
     unmeasured.push("volume calculé indisponible : un changement de dimensions de l'emprise ne peut pas être corroboré");
   }
   // centre de gravité : toujours signalé s'il bouge ; on précise la part non expliquée par l'emprise
-  const ca = solidKO ? null : cogVec(a), cb2 = solidKO ? null : cogVec(b);
-  const cogOk = ca && cb2 && ca.unit === cb2.unit;
   if (!cogOk && (ca || cb2)) unmeasured.push("centre de gravité");
   if (solidKO) Object.keys(a.flat).concat(Object.keys(b.flat)).filter(k => COG_PROP.test(k)).forEach(k => used.add(k));
-  const ga = cogOk ? ca.v : null, gb = cogOk ? cb2.v : null;
   if (ga && gb){
     Object.keys(a.flat).filter(k => COG_PROP.test(k)).forEach(k => used.add(k));
     const dec = v => (Math.abs(v) >= 0.05 && Math.abs(v) < 10) ? 1 : 0;
-    const g = [0,1,2].map(i => gb[i] - ga[i]);
-    const n = Math.hypot(...g);
+    const g = cogVecD;
+    const n = cogMovedMm;
     if (n > TOL.cogMm){
       sevMm(n);
       geo.push(`Centre de gravité déplacé de ${nf(n, n < 10 ? 1 : 0)} mm (${AX.map((ax,i) => "Δ" + ax + " " + sg(g[i], dec(g[i]))).join(" · ")} mm)`);
