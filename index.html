@@ -63,7 +63,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.6</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.7</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -163,6 +163,8 @@ function valEq(k, va, vb){
   if (OBB_PROP.test(k)) return true;
   const a = num(va), b = num(vb);
   if (!isNaN(a) && !isNaN(b)){
+    const pm = k.match(PLACE_PROP);
+    if (pm && !/xdir/i.test(pm[1])) return Math.abs(a - b) <= TOL.geoMm;   // origine / extrusion, en mm
     if (COG_PROP.test(k)) return true;                    // présent des deux côtés : traité globalement (distance 3D)
     if (QTY_PROP.test(k) || GEO_SET.test(k)) return Math.abs(a - b) <= Math.max(TOL.qtyAbs, TOL.qtyRel * Math.max(Math.abs(a), Math.abs(b)));
     return Math.abs(a - b) <= TOL.numRel * Math.max(1, Math.abs(a), Math.abs(b));
@@ -738,6 +740,30 @@ function opsDev(LA, LB){
   return { count: false, dev, measurable: true };
 }
 
+// Trimble expose la définition géométrique écrite dans l'IFC : origine du placement, vecteur
+// d'extrusion, direction du profil. C'est la géométrie AUTHORED, indépendante du maillage et de
+// l'emprise. Si elle est identique, l'objet n'a ni bougé, ni pivoté, ni changé de taille.
+const PLACE_PROP = /^extrusion\s*›\s*(origin|extrusion|xdir)\s*([xyz])$/i;
+function placementOf(o){
+  const v = {};
+  for (const k of Object.keys(o.flat)){
+    const m = k.match(PLACE_PROP); if (!m) continue;
+    const n = num(o.flat[k]); if (!isFinite(n)) return null;
+    v[(m[1] + m[2]).toLowerCase()] = n;
+  }
+  const need = ["originx","originy","originz","extrusionx","extrusiony","extrusionz"];
+  return need.every(k => k in v) ? v : null;
+}
+function samePlacement(pa, pb, tolMm){
+  if (!pa || !pb) return false;
+  for (const k of ["originx","originy","originz","extrusionx","extrusiony","extrusionz"])
+    if (Math.abs(pa[k] - pb[k]) > tolMm) return false;
+  // une direction de profil qui ne change QUE de signe décrit le même solide (repère réexprimé)
+  for (const k of ["xdirx","xdiry","xdirz"])
+    if (k in pa && k in pb && Math.abs(Math.abs(pa[k]) - Math.abs(pb[k])) > 1e-6) return false;
+  return true;
+}
+
 function describe(x){
   const { a, b } = x;
   // objet apparié par simple proximité (GUID régénérés) : l'appariement lui-même est une hypothèse,
@@ -828,8 +854,16 @@ function describe(x){
   const dimTxt = L => `Emprise ${dimLabel[L.i]} : ${nf(L.dA)} → ${nf(L.dB)} mm (${sg(L.dd)} mm)`;
   const movTxt = () => `${dimLines.length ? "Centre de l'emprise déplacé" : "Déplacé"} de ${nf(bbMoved)} mm (${AX.map((ax,i) => "Δ" + ax + " " + sg(bbShift[i])).join(" · ")} mm)`;
   let rotated = false;
+  const pA = placementOf(a), pB = placementOf(b);
+  const placeKnown = !!(pA && pB);
+  const placeSame = samePlacement(pA, pB, tol);
+  if (placeSame) Object.keys(a.flat).concat(Object.keys(b.flat)).filter(k => PLACE_PROP.test(k)).forEach(k => used.add(k));
 
-  if (!dimLines.length){
+  if (placeSame && (dimLines.length || bbMoved > tol)){
+    // La définition géométrique écrite dans l'IFC est identique : l'objet n'a ni bougé, ni pivoté,
+    // ni changé de taille. Ce que l'emprise indique est un artefact de reconstruction Trimble.
+    unmeasured.push(`emprise (${dimLines.map(L => sg(L.dd) + " mm sur " + dimLabel[L.i]).join(", ") || "centre déplacé de " + nf(bbMoved) + " mm"} — ignorée : origine et vecteur d'extrusion de l'IFC identiques, l'objet n'a ni bougé ni pivoté)`);
+  } else if (!dimLines.length){
     // dimensions conservées : l'emprise entière se déplace => vrai déplacement
     moved = bbMoved;
     if (moved > tol){ sevMm(moved); geo.push(movTxt()); }
@@ -986,7 +1020,8 @@ function describe(x){
   const np = props.length - (reclass ? 1 : 0);
   if (np) short.push(np === 1 ? props[reclass ? 1 : 0].split(" : ")[0].split(" › ").pop() + " modifié(e)" : `${np} propriétés modifiées`);
   if (false) short.push(props.length === 1 ? props[0].split(" : ")[0].split(" › ").pop() + " modifié(e)" : `${props.length} propriétés modifiées`);
-  return { geo, props, interp, short: (level === "verify" ? "à vérifier · " : "") + short.join(" · "), level, proof, unmeasured };
+  const bbSig = dimLines.length ? dimLines.map(L => Math.round(L.dd)).sort((p,q) => p - q).join("|") : "";
+  return { bbSig, volConserved, placeKnown, geo, props, interp, short: (level === "verify" ? "à vérifier · " : "") + short.join(" · "), level, proof, unmeasured };
 }
 
 function describeSingle(o, k, snap){
@@ -1089,6 +1124,27 @@ async function run(){
     diff.added.forEach(x => x.desc = describeSingle(x.b, "added", snapB));
     // ===== Filet de sécurité : aucun orange ne s'affiche sans preuve chiffrée valide =====
     // Tout élément qui échoue est RÉTROGRADÉ en « à vérifier » plutôt que présenté comme modifié.
+    // ---- Détecteur d'artefact systématique ----
+    // Un même écart d'emprise, au millimètre près, répété sur plusieurs objets dont le volume est
+    // conservé, n'est pas une modification de conception : c'est une signature de reconstruction.
+    const sig = new Map();
+    for (const x of diff.geom){
+      if (!x.desc.bbSig || !x.desc.volConserved || x.desc.placeKnown) continue;   // placement IFC lisible = preuve directe, on n'y touche pas
+      (sig.get(x.desc.bbSig) || sig.set(x.desc.bbSig, []).get(x.desc.bbSig)).push(x);
+    }
+    diff.systematic = 0;
+    for (const [k, list] of sig){
+      if (list.length < 3) continue;
+      diff.systematic += list.length;
+      for (const x of list){
+        x.desc.level = "verify";
+        x.desc.interp = `À vérifier : écart d'emprise identique (${k.replace(/\|/g, " et ")} mm) sur ${list.length} objets à volume conservé — signature d'un artefact de reconstruction Trimble, pas d'une modification de conception. ` + x.desc.interp;
+        x.desc.short = "à vérifier · artefact systématique · " + x.desc.short;
+        diff.geom.splice(diff.geom.indexOf(x), 1);
+        diff.verify.push(x);
+      }
+    }
+
     diff.audit = [];
     diff.unmeasurable = [];
     for (const k of ["geom","verify","props","same"]) for (const x of diff[k])
@@ -1148,11 +1204,12 @@ async function run(){
     const opNote = (snapA.openings + snapB.openings) ? "\nRéservations (IfcOpeningElement) masquées par défaut dans Trimble Connect : œil ▾ de la barre d'outils → « IFC Opening Elements » pour les voir." : "";
     const qty = [...snapB.map.values()].some(o => o.hasQty);
     const qtyNote = qty ? "" : "\nAucune quantité (volume/surface) dans cette maquette : un trou modélisé sans ouverture IFC ne sera pas détecté. Demander l'export IFC avec les quantités de base.";
+    const sys = diff.systematic ? `\n${diff.systematic} objet(s) présentant le même écart d'emprise à volume conservé : artefact de reconstruction, rétrogradés en « à vérifier ».` : "";
     const unm = diff.unmeasurable.length ? `\n${diff.unmeasurable.length} objet(s) dont une grandeur n'a pas pu être comparée (donnée absente dans une version) : non déclarés modifiés, listés dans le CSV.` : "";
     const aud = diff.audit.length ? `\n⚠ ${diff.audit.length} élément(s) rétrogradé(s) en « à vérifier » par le contrôle interne (preuve insuffisante) : ${diff.audit.slice(0,3).join(" | ")}${diff.audit.length > 3 ? " …" : ""}` : "";
     const chk = diff.incoherent ? `\n⛔ CONTRÔLE : ${diff.incoherent} élément(s) dont la couleur ne correspond pas à la fiche. Ne pas diffuser ce résultat, signaler le cas.` : "\n✔ Contrôle de cohérence : chaque orange repose sur une mesure chiffrée et une preuve.";
     const verNote = diff.verify.length ? `\n${diff.verify.length} objet(s) en jaune « à vérifier » : écart faible non confirmé par l'IFC, ne pas présenter comme modifié(s) sans contrôle.` : "";
-    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + chk + aud + unm + verNote + warn + reclNote + geoNote + hidNote + opNote + qtyNote + alert);
+    status(`Comparaison terminée (${snapA.map.size} → ${snapB.map.size} objets).` + chk + aud + sys + unm + verNote + warn + reclNote + geoNote + hidNote + opNote + qtyNote + alert);
   }catch(e){
     progress(null);
     status("Erreur pendant « " + (step || "préparation") + " » : " + (e.message || e) + "\nAstuce : réessaie, ou teste d'abord une maquette plus légère.", true);
