@@ -63,7 +63,7 @@
 <body>
 <div class="wrap">
   <h1>Comparateur de versions</h1>
-  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.7</span></div>
+  <div class="sub">Compare deux versions d'une même maquette (objets appariés par GUID). <span style="opacity:.6">· v3.9</span></div>
 
   <div class="card">
     <h2>1 · Maquette</h2>
@@ -583,7 +583,8 @@ async function snapshot(modelId, label, onP){
     onP && onP(1, `${label} : réservations ${Math.min(i + 6, openings.length)} / ${openings.length}`);
   }
   for (const o of map.values()) if (o._ops){ o.ops = o._ops; o.opGuids = o._opg || []; o.nOps = o._ops.length; delete o._ops; delete o._opg; }
-  return { map, total: ids.length, noGuid, spatial, openings: openings.length, hosted: nOpen };
+  return { map, total: ids.length, noGuid, spatial, openings: openings.length, hosted: nOpen,
+           openingList: openings.map(o => ({ guid: o.guid, bb: o.bb })) };
 }
 
 /* ===================== Comparaison ===================== */
@@ -932,17 +933,43 @@ function describe(x){
   } else if (od.count){
     // Une réservation « disparue » doit avoir disparu de la MAQUETTE, pas seulement du mur.
     // Si elle existe toujours dans l'autre version, c'est son rattachement qui a changé, pas la géométrie.
-    const ga = new Set(a.opGuids || []), gb = new Set(b.opGuids || []);
-    const partis = [...ga].filter(g => !gb.has(g));
-    const venus  = [...gb].filter(g => !ga.has(g));
-    const partisReels = partis.filter(g => snapB && !snapB.map.has(g));
-    const venusReels  = venus.filter(g => snapA && !snapA.map.has(g));
+    // Le GUID d'une réservation peut être régénéré à l'export : on cherche donc AUSSI une
+    // réservation au même emplacement. Et on exige que le volume de l'hôte corrobore :
+    // un percement supprimé rebouche le mur (volume en hausse), un percement ajouté le creuse.
+    const tm = tol / 1000;
+    const sameBox = (p, q) => p && q && p.every((v, n) => Math.abs(v - q[n]) <= tm);
+    const boxOf = (o, g) => { const i = (o.opGuids || []).indexOf(g); return i >= 0 ? (o.ops || [])[i] : null; };
+    const encoreLa = (g, box, autre) => {
+      if (autre && autre.map && autre.map.has(g)) return true;                               // même GUID ailleurs
+      if (!box || !autre || !autre.openingList) return false;
+      return autre.openingList.some(o => sameBox(box, o.bb));                                 // même emplacement
+    };
+    const gA = new Set(a.opGuids || []), gB = new Set(b.opGuids || []);
+    const partis = [...gA].filter(g => !gB.has(g));
+    const venus  = [...gB].filter(g => !gA.has(g));
+    const partisReels = partis.filter(g => !encoreLa(g, boxOf(a, g), snapB));
+    const venusReels  = venus.filter(g => !encoreLa(g, boxOf(b, g), snapA));
     const fantomes = (partis.length - partisReels.length) + (venus.length - venusReels.length);
+    const txt = `Réservations : ${na} → ${nb} (${sg(nb - na)})`;
+
     if (partisReels.length || venusReels.length){
-      opsChg = true; opsCount = true; big = true;
-      geo.push(`Réservations : ${na} → ${nb} (${sg(nb - na)}) — ${partisReels.length ? partisReels.length + " supprimée(s) de la maquette" : ""}${partisReels.length && venusReels.length ? ", " : ""}${venusReels.length ? venusReels.length + " ajoutée(s)" : ""}`);
+      const attendu = venusReels.length > partisReels.length ? -1 : +1;   // ajout => volume baisse
+      const observe = volAvailable ? Math.sign(vB0 - vA0) : 0;
+      const detail = `${partisReels.length ? partisReels.length + " supprimée(s)" : ""}${partisReels.length && venusReels.length ? ", " : ""}${venusReels.length ? venusReels.length + " ajoutée(s)" : ""}`;
+      if (volAvailable && observe === attendu && !volConserved){
+        opsChg = true; opsCount = true; big = true;
+        geo.push(`${txt} — ${detail}, confirmé par le volume de l'hôte : ${nf(vA0, 3)} → ${nf(vB0, 3)} m³ (${sg(vB0 - vA0, 3)} m³)`);
+      } else {
+        // Le volume calculé par Trimble ne reflète pas toujours les percements (vérifié sur ce projet :
+        // surface 19,97 m² = valeur sans percements). Il ne peut donc ni confirmer ni infirmer.
+        opsChg = true; opsCount = true; smallOther = true;   // à vérifier, jamais orange
+        const pourquoi = !volAvailable ? "volume de l'hôte indisponible"
+                       : volConserved ? `volume de l'hôte inchangé (${nf(vA0, 3)} m³), ce qui ne prouve rien : le volume calculé par Trimble ne tient pas forcément compte des percements`
+                       : `volume de l'hôte variant dans l'autre sens (${nf(vA0, 3)} → ${nf(vB0, 3)} m³)`;
+        geo.push(`${txt} — ${detail}. NON confirmé : ${pourquoi}. À contrôler dans la vue 3D : le percement peut subsister alors que l'objet IfcOpeningElement a disparu de l'export.`);
+      }
     } else if (fantomes){
-      unmeasured.push(`réservations (${na} → ${nb} : ${fantomes} réservation(s) toujours présente(s) dans l'autre version mais plus rattachée(s) à cet objet — rattachement Trimble, pas une suppression)`);
+      unmeasured.push(`réservations (${na} → ${nb} : ${fantomes} réservation(s) toujours présente(s) dans l'autre version, au même emplacement ou sous un autre GUID — rattachement Trimble, pas une suppression)`);
     } else {
       unmeasured.push(`réservations (${na} → ${nb} : identité des réservations non lisible)`);
     }
